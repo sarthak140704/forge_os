@@ -856,6 +856,87 @@ cargo run -p forge-runtime --example org_memory_smoke
 
 ---
 
+# Phase 5 — HTTP API server
+
+## TC-P5-01 · Health probe is unauthenticated, everything else requires bearer
+
+**Setup** — desktop is running; `Settings > HTTP API` shows `running` at `127.0.0.1:7823`. Set `$env:FORGE_API_TOKEN = "s3cr3t"` **before launching** the desktop so `token_set` reads true.
+
+**Prompts** (PowerShell):
+
+```powershell
+curl.exe -s -o NUL -w "%{http_code}`n" http://127.0.0.1:7823/health         # expect: 200
+curl.exe -s -o NUL -w "%{http_code}`n" http://127.0.0.1:7823/missions       # expect: 401
+curl.exe -s -o NUL -w "%{http_code}`n" -H "Authorization: Bearer wrong" `
+    http://127.0.0.1:7823/missions                                          # expect: 401
+curl.exe -s -o NUL -w "%{http_code}`n" -H "Authorization: Bearer $env:FORGE_API_TOKEN" `
+    http://127.0.0.1:7823/missions                                          # expect: 200
+```
+
+---
+
+## TC-P5-02 · POST /missions round-trips with `GET /missions/:id`
+
+**Prompt**:
+
+```powershell
+$body = @{ title = "api test"; description = "check that the shim boots a plan_and_run" } | ConvertTo-Json
+$resp = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:7823/missions `
+    -Headers @{Authorization="Bearer $env:FORGE_API_TOKEN"} `
+    -ContentType "application/json" -Body $body
+$id = $resp.id
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:7823/missions/$id" `
+    -Headers @{Authorization="Bearer $env:FORGE_API_TOKEN"} |
+    Select-Object -ExpandProperty mission
+```
+
+**Expected**: `mission` object with `id == $id`, `status ∈ { draft, planning, running, completed }` depending on how quickly you fetched. In the desktop UI, `Settings > Mission Queue` should show this mission listed; the DAG for this id shows real events as they land.
+
+---
+
+## TC-P5-03 · SSE `/events` streams live events with `?since` skip
+
+**Prompt** — open two PowerShell windows.
+
+Window 1:
+```powershell
+curl.exe -N -H "Authorization: Bearer $env:FORGE_API_TOKEN" `
+    "http://127.0.0.1:7823/events?since=0"
+```
+
+Window 2 (submit any mission via the UI or the curl above).
+
+**Expected in window 1**: an unending stream of `id: <seq>\nevent: forge.event\ndata: {...}\n\n` frames beginning with the desktop's boot events (seq > 0). Re-run with `?since=999999` and confirm no historical replay — only fresh events after the moment of subscription. Add `?mission=<uuid>` and confirm only that mission's cascade streams.
+
+---
+
+## TC-P5-04 · OpenAI-compat shim answers `POST /v1/chat/completions`
+
+**Prompt** (Python one-liner or any OpenAI SDK):
+
+```powershell
+curl.exe -H "Authorization: Bearer $env:FORGE_API_TOKEN" `
+    -H "Content-Type: application/json" `
+    -d '{"model":"forge","messages":[{"role":"user","content":"echo hi"}]}' `
+    http://127.0.0.1:7823/v1/chat/completions
+```
+
+**Expected**: a JSON body with `object: "chat.completion"`, one entry in `choices`, `finish_reason ∈ { "stop" | "error" | "length" | "cancelled" }`. If your LLM key is valid, `choices[0].message.content` contains a mission summary ("Mission Completed." + bullets per goal). `stream: true` returns 400 with a hint pointing at `/events`.
+
+---
+
+## TC-P5-05 · Runnable · end-to-end API smoke over real TCP
+
+```powershell
+cargo run -p forge-server --example api_smoke
+# expect: ✅ Phase 5 API smoke complete.
+# 7 assertions: /health, wrong-bearer 401, POST /missions, GET /missions/:id,
+# cancel, /v1/chat/completions with finish_reason="error" (dummy LLM key),
+# /events SSE stream. LLM-free.
+```
+
+---
+
 ## TC-BUG-01 · Mission-filter after create shows the new mission's events
 
 **Regression check for the `msn_<uuid>` vs raw-UUID mismatch.**
@@ -1097,6 +1178,7 @@ Run in this order. Any FAIL → don't ship.
 | 6 | TC-P4D-02/03/04 (worker pool smoke) | Runnable | 30 s |
 | 7 | TC-P4E-01 (postgres dispatch smoke) | Runnable | 10 s |
 | 8 | TC-P4F-05 (org memory storage smoke) | Runnable | 15 s |
+| 8b | TC-P5-05 (API server end-to-end smoke) | Runnable | 25 s |
 | 9 | TC-X-05 (checkpoints smoke) | Runnable | 30 s |
 | 10 | TC-X-03 (materialize smoke) — needs GROQ_API_KEY | Runnable | 30 s |
 | 11 | TC-X-02 (MCP round-trip) | Runnable | 30 s |
@@ -1107,6 +1189,7 @@ Run in this order. Any FAIL → don't ship.
 | 16 | TC-P4C-01 (curator auto-archives duplicate) | UI+backend | 1 min |
 | 17 | TC-P3-03 (checkpoint file gone after revert) | UI+backend | 1 min |
 | 18 | TC-P4F-01/02 (memory learned then recalled on next mission) | UI+backend | 3 min |
+| 19 | TC-P5-01/02/03 (HTTP API + SSE end-to-end from host tools) | UI+backend | 2 min |
 
 If all 10 pass, the system is verifiably working end-to-end: UI, IPC, event bus, persistence, LLM router, planner, executor, tools, policy, skills (load/select/validate/promote/rollback/retire/autopromote), reflection, cost tracking, checkpoints, MCP, materializer.
 

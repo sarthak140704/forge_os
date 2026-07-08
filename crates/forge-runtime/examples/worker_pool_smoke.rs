@@ -60,6 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // rather than waiting the desktop default of 120s.
         worker_stale_secs: 6,
         org_memory_enabled: true,
+        api_bind: None,
+        api_token_env: String::new(),
     };
     let runtime = Runtime::boot(config).await?;
     let mut rx = runtime.events.subscribe();

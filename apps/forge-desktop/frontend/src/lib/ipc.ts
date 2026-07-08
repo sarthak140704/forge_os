@@ -237,3 +237,22 @@ export async function listOrgMemory(limit?: number): Promise<OrgMemoryRow[]> {
 export async function deleteOrgMemory(id: number): Promise<boolean> {
   return invoke<boolean>("delete_org_memory", { id });
 }
+
+// ---------- Phase 5 — HTTP API server ----------
+
+export interface ApiStatus {
+  /** e.g. "127.0.0.1:7823" or null when server disabled. */
+  bind: string | null;
+  /** Env var name we read the bearer token from. */
+  token_env: string;
+  /** True if that env var was non-empty at boot. */
+  token_set: boolean;
+  /** Copy-paste PowerShell curl example. */
+  curl_example: string;
+  /** [method, path] pairs (documentation only). */
+  endpoints: [string, string][];
+}
+
+export async function apiStatus(): Promise<ApiStatus> {
+  return invoke<ApiStatus>("api_status");
+}

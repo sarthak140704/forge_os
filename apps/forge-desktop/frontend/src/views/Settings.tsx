@@ -21,6 +21,7 @@ import {
   queueStatus,
   listOrgMemory,
   deleteOrgMemory,
+  apiStatus,
   type Checkpoint,
   type CuratorSuggestion,
   type CuratorReport,
@@ -65,6 +66,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
           <SecretsSection />
           <QueueSection />
           <MemorySection />
+          <ApiSection />
           <CheckpointsSection />
           <SkillsSection />
           <AuditSection />
@@ -318,6 +320,76 @@ function MemoryRow({ row, onDelete }: { row: OrgMemoryRow; onDelete: () => void 
       <div className="text-sm font-medium">{row.key}</div>
       <div className="text-xs text-forge-muted whitespace-pre-wrap">{row.value}</div>
     </div>
+  );
+}
+
+// ---------- HTTP API server (Phase 5) ----------
+
+function ApiSection() {
+  const s = useQuery({
+    queryKey: ["api-status"],
+    queryFn: apiStatus,
+    refetchInterval: 30000,
+    refetchOnWindowFocus: false,
+  });
+
+  const running = !!s.data?.bind;
+
+  return (
+    <Section
+      title="HTTP API"
+      hint={running
+        ? "Loopback HTTP + SSE server is running. Any tool speaking the OpenAI Chat Completions API can be pointed at this endpoint."
+        : "HTTP API server is disabled. Set api_bind in RuntimeConfig to enable it."}
+    >
+      {s.isLoading && <Muted>Loading…</Muted>}
+      {s.data && (
+        <>
+          <div className="flex items-center gap-3 mb-3 text-sm">
+            <Badge tone={running ? "success" : "info"}>
+              {running ? "running" : "disabled"}
+            </Badge>
+            {running && (
+              <span className="font-mono">http://{s.data.bind}</span>
+            )}
+          </div>
+
+          {running && (
+            <>
+              <div className="mb-3">
+                <div className="text-xs text-forge-muted mb-1">Bearer token</div>
+                <Badge tone={s.data.token_set ? "success" : "warn"}>
+                  {s.data.token_set
+                    ? `set via $env:${s.data.token_env}`
+                    : `unset (auth disabled) — set $env:${s.data.token_env}`}
+                </Badge>
+              </div>
+
+              <div className="mb-3">
+                <div className="text-xs text-forge-muted mb-1">Endpoints</div>
+                <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs font-mono">
+                  {s.data.endpoints.map(([m, p]) => (
+                    <>
+                      <span className="text-forge-muted">{m}</span>
+                      <span>{p}</span>
+                    </>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-xs text-forge-muted mb-1">Quick check</div>
+                <Card>
+                  <code className="text-xs whitespace-pre-wrap break-all">
+                    {s.data.curl_example}
+                  </code>
+                </Card>
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </Section>
   );
 }
 

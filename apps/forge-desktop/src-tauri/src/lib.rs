@@ -33,6 +33,10 @@ struct AppState {
     queue:        Arc<dyn forge_persistence::MissionQueueRepository>,
     org_memory:   Arc<dyn forge_persistence::OrgMemoryRepository>,
     worker_count: usize,
+    // Phase 5 — API server observability
+    api_bind:       Option<std::net::SocketAddr>,
+    api_token_env:  String,
+    api_token_set:  bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +407,50 @@ async fn delete_org_memory(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 5 — API server observability
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ApiStatusIpc {
+    /// `"127.0.0.1:7823"` when running, `None` when the server is disabled.
+    bind:          Option<String>,
+    /// Env var name we read the bearer token from.
+    token_env:     String,
+    /// `true` if that env var was non-empty at boot.
+    token_set:     bool,
+    /// Ready-to-copy curl example (only meaningful when bind.is_some()).
+    curl_example:  String,
+    /// Endpoint catalog for the Settings UI.
+    endpoints:     Vec<(&'static str, &'static str)>,
+}
+
+#[tauri::command]
+async fn api_status(state: State<'_, Arc<AppState>>) -> Result<ApiStatusIpc, String> {
+    let bind = state.api_bind.map(|a| a.to_string());
+    let base = bind.as_deref().unwrap_or("127.0.0.1:7823");
+    let curl_example = format!(
+        "curl -H \"Authorization: Bearer $env:{}\" http://{}/missions",
+        state.api_token_env, base
+    );
+    Ok(ApiStatusIpc {
+        bind,
+        token_env: state.api_token_env.clone(),
+        token_set: state.api_token_set,
+        curl_example,
+        endpoints: vec![
+            ("GET",  "/health"),
+            ("POST", "/missions"),
+            ("GET",  "/missions"),
+            ("GET",  "/missions/:id"),
+            ("POST", "/missions/:id/cancel"),
+            ("POST", "/missions/:id/extend"),
+            ("GET",  "/events"),
+            ("POST", "/v1/chat/completions"),
+        ],
+    })
+}
+
+// ---------------------------------------------------------------------------
 // App entry
 // ---------------------------------------------------------------------------
 
@@ -465,6 +513,7 @@ pub fn run() {
             queue_status,
             list_org_memory,
             delete_org_memory,
+            api_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
@@ -541,6 +590,8 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         workers: 2,
         worker_stale_secs: 120,
         org_memory_enabled: true,
+        api_bind: Some("127.0.0.1:7823".parse().unwrap()),
+        api_token_env: "FORGE_API_TOKEN".to_string(),
     };
     // On first run, seed the skills dir from the bundled defaults if it's empty.
     let skills_root = app_data.join("skills").join("active");
@@ -564,6 +615,9 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
     }
     let runtime = Runtime::boot(config).await?;
     let worker_count = runtime.config.workers;
+    let api_bind      = runtime.config.api_bind;
+    let api_token_env = runtime.config.api_token_env.clone();
+    let api_token_set = !std::env::var(&api_token_env).unwrap_or_default().is_empty();
     Ok(Arc::new(AppState {
         missions: runtime.missions,
         events: runtime.events,
@@ -575,6 +629,9 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         queue:      runtime.queue,
         org_memory: runtime.org_memory,
         worker_count,
+        api_bind,
+        api_token_env,
+        api_token_set,
     }))
 }
 

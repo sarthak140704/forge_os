@@ -226,11 +226,25 @@ pub struct RuntimeConfig {
     /// bare-bones deployments stay minimal.
     #[serde(default)]
     pub org_memory_enabled: bool,
+
+    /// Phase 5 — HTTP API server. If `Some(addr)`, `Runtime::boot`
+    /// spawns an axum server bound to `addr` exposing REST + SSE +
+    /// OpenAI-compat endpoints. Defaults to `None` (server disabled).
+    /// Loopback addresses (127.0.0.1) are recommended — the server is
+    /// HTTP-only and auths via a bearer token.
+    #[serde(default)]
+    pub api_bind: Option<std::net::SocketAddr>,
+    /// Env-var name to read the API bearer token from. Empty or unset
+    /// disables auth (server logs a WARN). Defaults to
+    /// `"FORGE_API_TOKEN"`. Only used when `api_bind.is_some()`.
+    #[serde(default = "default_api_token_env")]
+    pub api_token_env: String,
 }
 fn default_max_parallel() -> usize { 4 }
 fn default_autopromote_interval_secs() -> u64 { 300 }
 fn default_curator_interval_secs() -> u64 { 900 }
 fn default_worker_stale_secs() -> u64 { 120 }
+fn default_api_token_env() -> String { "FORGE_API_TOKEN".to_string() }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LlmConfig {
@@ -714,6 +728,32 @@ impl Runtime {
         } else {
             None
         };
+
+        // Phase 5 — API server. Loopback HTTP + bearer auth + SSE +
+        // OpenAI-compat shim. Fire-and-forget: if the bind fails at boot
+        // we log an error and continue — the rest of the runtime is
+        // still usable from the desktop UI.
+        if let Some(bind) = config.api_bind {
+            let token = std::env::var(&config.api_token_env).unwrap_or_default();
+            if token.is_empty() {
+                tracing::warn!(
+                    env = %config.api_token_env,
+                    "API server starting with EMPTY bearer token — auth disabled. \
+                     Set the env var to a random secret before opening the bind to non-loopback traffic."
+                );
+            }
+            let state = forge_server::ApiState::new(
+                missions.clone(),
+                events.clone(),
+                token,
+            );
+            tokio::spawn(async move {
+                if let Err(e) = forge_server::serve(bind, state).await {
+                    tracing::error!(error = %e, %bind, "API server exited with error");
+                }
+            });
+            tracing::info!(%bind, "API server spawned");
+        }
 
         Ok(Self {
             config, pool, events, missions, tools, llm, mcp, checkpoints,

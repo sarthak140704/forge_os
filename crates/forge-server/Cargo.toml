@@ -1,0 +1,35 @@
+[package]
+name        = "forge-server"
+version     = { workspace = true }
+edition     = { workspace = true }
+description = "HTTP + SSE surface for Forge OS (Phase 5)"
+license     = { workspace = true }
+
+[dependencies]
+forge-domain      = { workspace = true }
+forge-events      = { workspace = true }
+forge-mission     = { workspace = true }
+forge-persistence = { workspace = true }
+
+axum         = { workspace = true }
+tower        = { workspace = true }
+tower-http   = { workspace = true }
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+uuid         = { workspace = true }
+time         = { workspace = true }
+
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+async-trait  = { workspace = true }
+futures      = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tempfile           = { workspace = true }
+reqwest            = { workspace = true }
+forge-runtime      = { workspace = true }
+forge-llm          = { workspace = true }

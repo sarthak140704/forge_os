@@ -44,7 +44,7 @@ events into a live React Flow DAG viewer.
 ## Phase 5 — Ecosystem
 - **Marketplace**: signed skill & plugin bundles.
 - **Team edition**: multi-user missions, RBAC, org-level policies.
-- **API server**: OpenAI-compatible endpoint (like Hermes) so any frontend can drive Forge.
+- **API server**: OpenAI-compatible endpoint (like Hermes) so any frontend can drive Forge. ✓ landed as loopback HTTP + bearer + SSE + non-streaming OpenAI-compat shim (Phase 5 — see BUILD_LOG). TLS + RBAC + streaming shim + WebSocket transport are deferred.
 - **Messaging gateway**: reuse or wrap Hermes gateway (Telegram/Slack/etc.).
 - **ACP editor integration**: VS Code, Zed, JetBrains.
 - **Voice mode, image gen, TTS, browser automation** (all deferred from spec §Media & Web).

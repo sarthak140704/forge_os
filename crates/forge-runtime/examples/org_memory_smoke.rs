@@ -55,6 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers: 0,
         worker_stale_secs: 60,
         org_memory_enabled: true,
+        api_bind: None,
+        api_token_env: String::new(),
     };
     let runtime = Runtime::boot(config).await?;
     let mut all_ok = true;

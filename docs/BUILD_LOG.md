@@ -590,6 +590,73 @@ cargo run -p forge-runtime --example org_memory_smoke     # 4/4 scenarios pass
 Covers insert × 3, list_active ordering, search by tag (rust=2, python=1), and idempotent retire.
 
 
+## Phase 5 — HTTP API server (SHIPPED)
+
+**Motivation (agent.txt):** *"Any tool that speaks HTTP should be able to drive Forge — CLIs, IDE plugins, chatbots."* Phase 5 exposes the same Runtime the desktop UI uses over a loopback HTTP server, plus a non-streaming OpenAI Chat-Completions compat shim so existing OpenAI-SDK code works unmodified.
+
+### Endpoints
+
+| Method | Path                          | Notes                                        |
+|--------|-------------------------------|----------------------------------------------|
+| GET    | `/health`                     | Unauthenticated liveness probe.              |
+| POST   | `/missions`                   | `{title, description, plan_only?}` → `{id}`. `plan_and_run` is dispatched **out-of-band** — subscribe to `/events` for progress. |
+| GET    | `/missions`                   | List all mission summaries.                  |
+| GET    | `/missions/:id`               | Full detail: mission + goals + tasks_by_goal.|
+| POST   | `/missions/:id/cancel`        | Idempotent cancel → 202.                     |
+| POST   | `/missions/:id/extend`        | `{prompt}` — append a follow-up.             |
+| GET    | `/events?since=<seq>&mission=<uuid>` | SSE stream of `EventEnvelope`. `since` skips replay; `mission` filters to a single mission's cascade. |
+| POST   | `/v1/chat/completions`        | OpenAI-compat shim. **Non-streaming only.** Maps `messages[]` → `(title, description)`, runs mission to termination (5 min cap), returns choices + finish_reason. |
+
+### Auth
+
+Every route except `/health` requires `Authorization: Bearer <token>`. Token is read once at boot from the env var named by `RuntimeConfig.api_token_env` (default `FORGE_API_TOKEN`); empty or unset = auth disabled with a boot-time WARN. Comparison uses `subtle`-style constant-time equality (4 unit tests).
+
+### Design decisions
+
+1. **Loopback-only default.** `RuntimeConfig::api_bind` defaults to `None`. Desktop sets it to `Some(127.0.0.1:7823)`. Plain HTTP is only safe on 127.0.0.1 — TLS + RBAC are out of scope for this phase.
+2. **Raw-UUID over the wire, always.** `MissionId::Display` renders `msn_<uuid>` but `#[serde(transparent)]` serializes raw — the exact bug that broke the desktop mission-filter in Phase 4. Every response body uses `id.as_uuid().to_string()`.
+3. **`POST /missions` is fire-and-forget.** The handler creates the mission, spawns `plan_and_run` in a detached tokio task, and returns the id immediately. A blocking implementation would hold the HTTP connection for the entire mission — unacceptable for long-running work.
+4. **SSE via `BroadcastStream`.** The events subscription is a `tokio::sync::broadcast::Receiver<EventEnvelope>` wrapped by `tokio_stream::wrappers::BroadcastStream`. Lagged frames are dropped silently; the next in-order envelope wins.
+5. **Mission filter is defensive-only.** Server-side we don't have goal→mission / task→goal indices, so only direct-mission events are strict-matched; task/goal-scoped events flow through and the client (which does have those indices via `useEventsStore`) can drop them.
+6. **OpenAI shim is minimal but honest.** `stream: true` returns 400 with "subscribe to /events instead" — implementing SSE-styled `data: {"choices":...}\n\n` frames is a large chunk of work with tiny payoff since `/events` already exists. Function-calling / logprobs / seed / n>1 are all silently ignored.
+
+### Wiring
+
+- `crates/forge-server/` — new crate. `lib.rs` (router + REST handlers + SSE), `openai_compat.rs` (shim). 8 unit tests.
+- `crates/forge-runtime/src/lib.rs` — added `api_bind: Option<SocketAddr>` + `api_token_env: String` fields to `RuntimeConfig`; `Runtime::boot` spawns `forge_server::serve(bind, state)` in a tokio task when `api_bind.is_some()`.
+- `apps/forge-desktop/src-tauri/src/lib.rs` — desktop sets `api_bind = Some(127.0.0.1:7823)`, exposes `api_status()` IPC.
+- `apps/forge-desktop/frontend/src/views/Settings.tsx` — new **HTTP API** section shows bind, token status, endpoint catalog, and a copy-paste PowerShell curl example.
+
+### Verify
+
+```powershell
+cargo run -p forge-server --example api_smoke   # 7/7 assertions pass
+```
+
+Boots a real Runtime on an ephemeral loopback port, drives it entirely over TCP with `reqwest`: `/health`, wrong-bearer 401, `POST /missions`, `GET /missions/:id`, cancel, `/v1/chat/completions` returning `finish_reason="error"` (dummy LLM key is expected), `/events` SSE stream. LLM-free.
+
+### Curl walkthrough (PowerShell)
+
+```powershell
+$env:FORGE_API_TOKEN = "s3cr3t"           # match Settings > HTTP API "token_env"
+# Health
+curl http://127.0.0.1:7823/health
+# Create mission (background execution)
+curl.exe -H "Authorization: Bearer $env:FORGE_API_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"title":"try it","description":"say hi"}' `
+  http://127.0.0.1:7823/missions
+# Stream events
+curl.exe -N -H "Authorization: Bearer $env:FORGE_API_TOKEN" `
+  http://127.0.0.1:7823/events
+# OpenAI-compat
+curl.exe -H "Authorization: Bearer $env:FORGE_API_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"model":"forge","messages":[{"role":"user","content":"hi"}]}' `
+  http://127.0.0.1:7823/v1/chat/completions
+```
+
+
 ## Bug fix — Mission-filter ID mismatch
 
 `MissionId`'s `Display` renders `msn_<uuid>` but `#[serde(transparent)]` serializes it as a raw UUID. Prior `create_mission` returned `id.to_string()` (prefixed), while every event payload + `list_missions` row uses the raw UUID form via serde. Result: the UI auto-selected the newly-created mission with the prefixed form but every event filtered on it never matched → the mission's DAG loaded but its event timeline stayed empty.
