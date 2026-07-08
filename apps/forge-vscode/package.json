@@ -1,0 +1,57 @@
+{
+  "name": "forge-os",
+  "displayName": "Forge OS",
+  "description": "Drive a local Forge OS runtime from VS Code. Ships two commands that talk to the OpenAI-compat chat shim.",
+  "version": "0.1.0",
+  "publisher": "sarthak",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Other", "Machine Learning"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "forgeOs.health",
+        "title": "Forge: Check server health",
+        "category": "Forge"
+      },
+      {
+        "command": "forgeOs.runMission",
+        "title": "Forge: Run mission (prompt)",
+        "category": "Forge"
+      },
+      {
+        "command": "forgeOs.runSelectionAsChat",
+        "title": "Forge: Send selection as chat",
+        "category": "Forge"
+      }
+    ],
+    "configuration": {
+      "title": "Forge OS",
+      "properties": {
+        "forgeOs.apiUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:7823",
+          "description": "Base URL of the Forge API server."
+        },
+        "forgeOs.apiToken": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token. Prefer keeping this empty and setting FORGE_API_TOKEN in your environment instead — VS Code settings are stored in plain text."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "node esbuild.mjs",
+    "package": "vsce package --no-dependencies -o forge-os.vsix"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^3.0.0"
+  }
+}

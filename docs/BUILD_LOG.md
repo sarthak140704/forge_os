@@ -657,6 +657,106 @@ curl.exe -H "Authorization: Bearer $env:FORGE_API_TOKEN" `
 ```
 
 
+## Phase 5b — Headless CLI + VS Code extension + Signed skill bundles (SHIPPED)
+
+**Motivation (agent.txt):** *"Any tool that speaks HTTP should be able to drive Forge."* Phase 5a exposed the HTTP surface; Phase 5b delivers the three highest-value clients so users don't have to write curl scripts:
+
+1. `forge` — a headless CLI that wraps every route.
+2. A VS Code extension that speaks the OpenAI-compat shim.
+3. Signed skill bundles so shared skills can be trusted.
+
+### 1 · `apps/forge-cli` — the `forge` binary
+
+Single-binary CLI built on `clap` + `reqwest` + `eventsource-stream`. Reads `FORGE_API_URL` and `FORGE_API_TOKEN` from the env by default; both are overridable per invocation with `--url` and `--token`.
+
+Subcommands:
+
+| Command | Behaviour |
+|---|---|
+| `forge health` | Ping `/health`. Exit 0 iff 2xx. Ignores the bearer. |
+| `forge missions list [--status …] [--limit N]` | GET `/missions`, print a table. `--json` for machine output. |
+| `forge missions get <ID>` | GET `/missions/:id`. Pretty by default, `--json` for JSON. |
+| `forge missions create <TITLE> [--description] [--plan-only]` | POST `/missions`. |
+| `forge missions cancel <ID>` | POST `/missions/:id/cancel`. |
+| `forge missions extend <ID> <PROMPT>` | POST `/missions/:id/extend`. |
+| `forge run <TITLE> [--wait] [--stream]` | Shorthand for create+wait. `--stream` tails events during the wait. |
+| `forge events [--mission ID] [--since N] [--follow \| --once]` | SSE tail of `/events`. |
+| `forge chat <PROMPT> [--system …]` | POST `/v1/chat/completions`, print response body. |
+| `forge skill bundle DIR --out FILE --key KEY` | Package a skill directory into a signed `.forgebundle.json`. |
+| `forge skill verify FILE [--pubkey KEY]` | Verify signature; optionally assert exact pubkey. |
+| `forge skill install FILE [--dest DIR] [--pubkey KEY] [--force]` | Verify then unpack. Refuses path-traversal filenames. |
+| `forge keygen --out FILE` | Generate an ed25519 keypair (private → `FILE`, public → `FILE.pub`). |
+
+Design decisions:
+- **`--json` global flag** — every subcommand emits either human-friendly output (default) or newline-delimited JSON so the CLI composes with `jq`, PowerShell `ConvertFrom-Json`, etc.
+- **Colour-free** — this is a CI-friendly CLI. Where we want to draw attention we use plain-text sigils (`✓ ✗ …`) that render everywhere.
+- **`Command::spawn` in tests, not the reqwest client** — the integration test shells out to the *built* binary so we test the real code paths a user sees, not a fake in-process client.
+- **`RUST_LOG` gates tracing** — no chatty output by default, opt-in via env var.
+
+### 2 · `apps/forge-vscode` — VS Code extension
+
+TypeScript extension bundled with esbuild. Registers three commands:
+
+- `Forge: Check server health` — pings `/health`, shows a notification.
+- `Forge: Run mission (prompt)` — input box for title (+ optional description), POSTs `/missions`, shows the id.
+- `Forge: Send selection as chat` — sends the current editor selection (or prompts) to `/v1/chat/completions`, opens a scratch markdown doc with the response.
+
+Settings: `forgeOs.apiUrl`, `forgeOs.apiToken`. `$env:FORGE_API_TOKEN` beats settings.json so secrets don't have to live in plain text. Extension is ~5 KB compiled — deliberately tiny, all state lives in Forge.
+
+### 3 · Signed skill bundles (`apps/forge-cli/src/bundle.rs`)
+
+Bundle shape:
+
+```jsonc
+{
+  "manifest":  { "name": "…", "version": 1, … },   // parsed YAML frontmatter of the primary .md
+  "files":    { "rel/path": "<base64 bytes>", … },  // every file under the skill dir, sorted
+  "signature": "<base64 ed25519 signature>",        // over {manifest, files}
+  "pubkey":    "<base64 ed25519 public key>"        // pubkey that produced the signature
+}
+```
+
+**What gets signed** is `serde_json::to_vec({manifest, files})`. Two bundles built from the same directory produce byte-identical signed payloads → signatures are reproducible. Signature is checked with `ed25519_dalek::VerifyingKey::verify`.
+
+Trust model: each bundle carries the pubkey that signed it. `verify --pubkey <FILE>` asserts the bundle was signed by exactly the expected key — catches "valid signature from the wrong signer" attacks. `install` refuses filenames containing `..`, leading `/`, or leading `\` — no path-traversal.
+
+Sample workflow:
+
+```powershell
+forge keygen --out $env:USERPROFILE\.forge\alice_ed25519
+# publish alice_ed25519.pub
+
+forge skill bundle .\my-skill\ --out my-skill.forgebundle.json --key $env:USERPROFILE\.forge\alice_ed25519
+# → my-skill.forgebundle.json shipped to the world
+
+# consumer:
+forge skill verify my-skill.forgebundle.json --pubkey alice_ed25519.pub
+forge skill install my-skill.forgebundle.json --dest $env:APPDATA\com.sarthak.forgeos\skills\active --pubkey alice_ed25519.pub
+```
+
+### Verify
+
+```powershell
+# unit + integration + tamper detection
+cargo test -p forge-cli --test end_to_end -- --nocapture
+# expect: 2 passed; 0 failed
+#   cli_end_to_end     — spins a live Runtime + API server, drives every route
+#   cli_bundle_roundtrip — keygen → bundle → verify → install → tamper → verify fails
+```
+
+The `cli_end_to_end` test uses `#[tokio::test(flavor = "multi_thread")]` — a single-threaded runtime starves axum when the test blocks on `Command::output`.
+
+### Files landed
+
+- `apps/forge-cli/Cargo.toml` — new binary crate.
+- `apps/forge-cli/src/{main.rs, client.rs, render.rs, bundle.rs}`.
+- `apps/forge-cli/src/cmd/{mod.rs, health.rs, missions.rs, events.rs, chat.rs, skill.rs}`.
+- `apps/forge-cli/tests/end_to_end.rs` — 2 tests, both green.
+- `apps/forge-vscode/{package.json, tsconfig.json, esbuild.mjs, README.md, .gitignore}`.
+- `apps/forge-vscode/src/extension.ts` — extension entrypoint.
+- `Cargo.toml` root — added `clap`, `ed25519-dalek`, `rand_core`, `base64`, `eventsource-stream`, `directories`, `walkdir` to `[workspace.dependencies]`; added `apps/forge-cli` to `[workspace] members`.
+
+
 ## Bug fix — Mission-filter ID mismatch
 
 `MissionId`'s `Display` renders `msn_<uuid>` but `#[serde(transparent)]` serializes it as a raw UUID. Prior `create_mission` returned `id.to_string()` (prefixed), while every event payload + `list_missions` row uses the raw UUID form via serde. Result: the UI auto-selected the newly-created mission with the prefixed form but every event filtered on it never matched → the mission's DAG loaded but its event timeline stayed empty.

@@ -172,4 +172,9 @@ Next steps:
        cd apps/forge-desktop
        node ./frontend/node_modules/@tauri-apps/cli/tauri.js dev \\
            --config ./src-tauri/tauri.conf.json
+  4. Optional — build the headless CLI:
+       cargo install --path apps/forge-cli
+       forge --help
+  5. Optional — VS Code extension:
+       cd apps/forge-vscode && npm install && npm run compile   # then press F5 in VS Code
 EOM

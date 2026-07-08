@@ -42,11 +42,12 @@ events into a live React Flow DAG viewer.
 - **Curator**: automated skill deprecation, dedupe, merge. ✓ landed (Phase 4c)
 
 ## Phase 5 — Ecosystem
-- **Marketplace**: signed skill & plugin bundles.
+- **Marketplace**: signed skill & plugin bundles. ✓ landed *signed skill bundles* (Phase 5b — `forge skill bundle|verify|install` with ed25519 signatures + `forge keygen`; distribution registry / discovery UX is deferred). *Signed plugin bundles* still open.
 - **Team edition**: multi-user missions, RBAC, org-level policies.
-- **API server**: OpenAI-compatible endpoint (like Hermes) so any frontend can drive Forge. ✓ landed as loopback HTTP + bearer + SSE + non-streaming OpenAI-compat shim (Phase 5 — see BUILD_LOG). TLS + RBAC + streaming shim + WebSocket transport are deferred.
+- **API server**: OpenAI-compatible endpoint (like Hermes) so any frontend can drive Forge. ✓ landed as loopback HTTP + bearer + SSE + non-streaming OpenAI-compat shim (Phase 5a). TLS + RBAC + streaming shim + WebSocket transport are deferred.
+- **Headless CLI**: `forge` binary wrapping the API. ✓ landed (Phase 5b — all subcommands + signed skill bundles + integration test).
 - **Messaging gateway**: reuse or wrap Hermes gateway (Telegram/Slack/etc.).
-- **ACP editor integration**: VS Code, Zed, JetBrains.
+- **ACP editor integration**: VS Code, Zed, JetBrains. ✓ landed *VS Code extension* (Phase 5b — health / run mission / send-selection-as-chat via OpenAI shim). Zed / JetBrains still open.
 - **Voice mode, image gen, TTS, browser automation** (all deferred from spec §Media & Web).
 
 ## Explicit non-goals for a *personal* project

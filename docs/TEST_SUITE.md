@@ -937,6 +937,114 @@ cargo run -p forge-server --example api_smoke
 
 ---
 
+# Phase 5b — CLI + VS Code + skill bundles
+
+## TC-P5B-01 · `forge health` behaves like a real Unix probe
+
+**Setup** — desktop is running (or spawn any Forge Runtime with `api_bind`).
+
+**Prompt** (PowerShell):
+
+```powershell
+$env:FORGE_API_URL   = "http://127.0.0.1:7823"
+$env:FORGE_API_TOKEN = "s3cr3t"   # match your desktop's FORGE_API_TOKEN
+
+.\target\debug\forge.exe health           # → exit 0, "status: 200 OK"
+$env:FORGE_API_URL   = "http://127.0.0.1:1"
+.\target\debug\forge.exe health           # → exit non-zero, "operation timed out" or "connection refused"
+```
+
+Also verify: `forge health` exits 0 even with a wrong bearer, because `/health` is unauthenticated.
+
+---
+
+## TC-P5B-02 · `forge missions` round-trip drives the API cleanly
+
+```powershell
+$env:FORGE_API_TOKEN = "s3cr3t"
+.\target\debug\forge.exe missions list                                    # (no missions) or table
+$id = (.\target\debug\forge.exe --json missions create "cli test" --plan-only |
+       ConvertFrom-Json).id
+.\target\debug\forge.exe missions get $id                                 # detail table
+.\target\debug\forge.exe missions list --limit 5                          # includes $id
+.\target\debug\forge.exe missions cancel $id                              # "cancelled: <uuid>"
+```
+
+`--json` on any subcommand switches to newline-delimited JSON output ready to pipe into `jq`.
+
+---
+
+## TC-P5B-03 · `forge run --wait --stream` blocks until terminal
+
+**Prompt**:
+
+```powershell
+$env:FORGE_API_TOKEN = "s3cr3t"
+.\target\debug\forge.exe run "print hello then exit" --wait --stream
+```
+
+Expected: live event summaries stream to stdout (`[#123 2026-…] mission_created …`), the process exits when the mission reaches `completed | failed | cancelled`, and the last stdout block is the goal-by-goal summary. Exit code 0 as long as the mission itself finished (even if `failed` — that's the mission's outcome, not a CLI error).
+
+---
+
+## TC-P5B-04 · Signed skill bundle round-trip + tamper detection
+
+**Prompt**:
+
+```powershell
+.\target\debug\forge.exe keygen --out $env:TEMP\forge_test_key
+# writes forge_test_key + forge_test_key.pub
+
+New-Item -ItemType Directory -Force $env:TEMP\my-skill | Out-Null
+Set-Content $env:TEMP\my-skill\my-skill.md "---`nname: my-skill`nversion: 1`n---`n`nBody."
+
+.\target\debug\forge.exe skill bundle $env:TEMP\my-skill `
+    --out $env:TEMP\my-skill.forgebundle.json `
+    --key $env:TEMP\forge_test_key
+
+.\target\debug\forge.exe skill verify $env:TEMP\my-skill.forgebundle.json `
+    --pubkey $env:TEMP\forge_test_key.pub                                # → "signature OK"
+
+.\target\debug\forge.exe skill install $env:TEMP\my-skill.forgebundle.json `
+    --dest $env:TEMP\installed --pubkey $env:TEMP\forge_test_key.pub     # → "installed 1 files"
+
+# Tamper — flip a byte in the base64 file contents:
+$b = Get-Content $env:TEMP\my-skill.forgebundle.json -Raw | ConvertFrom-Json
+$b.files.PSObject.Properties | ForEach-Object { $_.Value = "dGFtcGVy" }
+$b | ConvertTo-Json -Depth 10 | Set-Content $env:TEMP\my-skill.forgebundle.json
+
+.\target\debug\forge.exe skill verify $env:TEMP\my-skill.forgebundle.json # → non-zero exit
+```
+
+---
+
+## TC-P5B-05 · Runnable · full CLI integration suite
+
+```powershell
+cargo test -p forge-cli --test end_to_end -- --nocapture
+# expect: 2 passed; 0 failed
+#   cli_end_to_end       — spins a real Runtime, drives every route via `Command::spawn`
+#   cli_bundle_roundtrip — keygen → bundle → verify → install → tamper → verify fails
+```
+
+---
+
+## TC-P5B-06 · VS Code extension one-shot
+
+**Setup** — desktop running with API up; `apps/forge-vscode/` opened as a folder in VS Code with `npm install && npm run compile` already done.
+
+**Prompt** — press **F5** to launch an Extension Development Host. In the new window:
+
+1. Command Palette → `Forge: Check server health` → notification `Forge server OK at http://127.0.0.1:7823`.
+2. Command Palette → `Forge: Run mission (prompt)` → type a title, hit Enter. Notification `Forge: mission xxxxxxxx… created`.
+3. Select any text in an editor → Command Palette → `Forge: Send selection as chat` → a scratch markdown doc opens, then updates in place with the response body + `finish_reason`.
+
+**Failure modes to sanity-check**:
+- Wrong `forgeOs.apiUrl` → notification `Forge server unreachable at <url>: <reason>`.
+- Empty token when server requires one → the chat command surfaces the 401 body as an error notification.
+
+---
+
 ## TC-BUG-01 · Mission-filter after create shows the new mission's events
 
 **Regression check for the `msn_<uuid>` vs raw-UUID mismatch.**
@@ -1179,6 +1287,7 @@ Run in this order. Any FAIL → don't ship.
 | 7 | TC-P4E-01 (postgres dispatch smoke) | Runnable | 10 s |
 | 8 | TC-P4F-05 (org memory storage smoke) | Runnable | 15 s |
 | 8b | TC-P5-05 (API server end-to-end smoke) | Runnable | 25 s |
+| 8c | TC-P5B-05 (CLI integration suite) | Runnable | 45 s |
 | 9 | TC-X-05 (checkpoints smoke) | Runnable | 30 s |
 | 10 | TC-X-03 (materialize smoke) — needs GROQ_API_KEY | Runnable | 30 s |
 | 11 | TC-X-02 (MCP round-trip) | Runnable | 30 s |
@@ -1190,6 +1299,8 @@ Run in this order. Any FAIL → don't ship.
 | 17 | TC-P3-03 (checkpoint file gone after revert) | UI+backend | 1 min |
 | 18 | TC-P4F-01/02 (memory learned then recalled on next mission) | UI+backend | 3 min |
 | 19 | TC-P5-01/02/03 (HTTP API + SSE end-to-end from host tools) | UI+backend | 2 min |
+| 20 | TC-P5B-02/04 (forge CLI missions + skill bundles) | UI+backend | 2 min |
+| 21 | TC-P5B-06 (VS Code extension smoke) | UI+backend | 2 min |
 
 If all 10 pass, the system is verifiably working end-to-end: UI, IPC, event bus, persistence, LLM router, planner, executor, tools, policy, skills (load/select/validate/promote/rollback/retire/autopromote), reflection, cost tracking, checkpoints, MCP, materializer.
 
