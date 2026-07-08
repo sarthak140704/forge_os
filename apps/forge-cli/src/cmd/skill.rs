@@ -1,4 +1,4 @@
-use crate::bundle;
+use crate::bundle::{self, BundleKind};
 use anyhow::Result;
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -40,12 +40,19 @@ pub enum Op {
 }
 
 pub async fn dispatch(json: bool, op: Op) -> Result<()> {
+    dispatch_kind(BundleKind::Skill, json, op).await
+}
+
+/// Shared dispatcher used by both `forge skill` and `forge plugin` — the
+/// only difference is which manifest layout `Bundle` expects.
+pub async fn dispatch_kind(kind: BundleKind, json: bool, op: Op) -> Result<()> {
     let _ = json; // no JSON output path here; all outputs are short prose
     match op {
-        Op::Bundle { dir, out, key } => bundle::sign_bundle(&dir, &out, &key),
+        Op::Bundle { dir, out, key } => bundle::sign_bundle(&dir, &out, &key, kind),
         Op::Verify { bundle: b, pubkey } => {
-            let _ = bundle::verify_bundle(&b, pubkey.as_deref())?;
-            println!("signature OK");
+            let parsed = bundle::verify_bundle(&b, pubkey.as_deref())?;
+            let got_kind = parsed.kind.unwrap_or(BundleKind::Skill);
+            println!("signature OK  (kind: {:?})", got_kind);
             Ok(())
         }
         Op::Install { bundle: b, dest, pubkey, force } => {

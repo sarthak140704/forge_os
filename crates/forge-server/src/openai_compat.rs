@@ -26,12 +26,18 @@
 
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
-use forge_domain::MissionStatus;
+use forge_domain::{EventEnvelope, ForgeEvent, MissionId, MissionStatus};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::time::{Duration, Instant};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
-use crate::{check_auth, ApiError, ApiState};
+use crate::{require_full, ApiError, ApiState};
 
 // ---------------------------------------------------------------------------
 // Request / response DTOs — subset of the OpenAI shape.
@@ -108,14 +114,9 @@ pub async fn chat_completions(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, ApiError> {
-    check_auth(&state, &headers)?;
+) -> Result<Response, ApiError> {
+    require_full(&state, &headers)?;
 
-    if req.stream {
-        return Err(ApiError::BadRequest(
-            "streaming (stream=true) is not implemented — subscribe to /events instead".into()
-        ));
-    }
     let (title, description) = messages_to_mission(&req.messages)
         .ok_or_else(|| ApiError::BadRequest("at least one user message is required".into()))?;
 
@@ -131,6 +132,12 @@ pub async fn chat_completions(
                     "openai-compat: background plan_and_run failed (mission marked Failed)");
             }
         });
+    }
+
+    // Streaming path (Phase 5c): emit SSE chunks derived from live events.
+    if req.stream {
+        let model_name = if req.model.is_empty() { "forge-mission".to_string() } else { req.model.clone() };
+        return Ok(streaming_completion(state.clone(), mid, model_name).into_response());
     }
 
     // Poll until terminal or timeout.
@@ -190,11 +197,188 @@ pub async fn chat_completions(
             total_tokens: prompt_tokens + content_tokens,
         },
         forge_mission_id: mid.as_uuid().to_string(),
-    }))
+    }).into_response())
 }
 
 fn is_terminal(s: &MissionStatus) -> bool {
     matches!(s, MissionStatus::Completed | MissionStatus::Failed | MissionStatus::Cancelled)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming shim (Phase 5c) — `stream: true` on /v1/chat/completions.
+// ---------------------------------------------------------------------------
+//
+// The output is a `text/event-stream` where each SSE `data:` frame is a
+// serialized `chat.completion.chunk` compatible with OpenAI's spec:
+//
+//   data: {"id":"...","object":"chat.completion.chunk","choices":[
+//          {"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+//
+//   data: {"id":"...","choices":[{"index":0,"delta":{"content":"..."},...}]}
+//
+//   data: {"id":"...","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+//
+//   data: [DONE]
+//
+// We derive the `content` deltas from Forge's own `ForgeEvent`s so a caller
+// gets human-readable, live progress instead of raw tokens (which we don't
+// have — Forge composes tools, not tokens). The terminal frame carries the
+// OpenAI-shaped `finish_reason`.
+//
+// Backpressure: if a slow client falls off the broadcast channel we skip
+// missed events (BroadcastStream::Lagged) and keep going.
+
+fn streaming_completion(
+    state: ApiState,
+    mid: MissionId,
+    model: String,
+) -> Sse<impl Stream<Item = Result<SseEvent, axum::Error>>> {
+    let id = format!("chatcmpl-{}", mid.as_uuid());
+    let created = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, axum::Error>>(64);
+
+    // ---- Producer task: fan events + status polls into SSE chunks. ----
+    let bus_rx = state.events.subscribe();
+    let missions = state.missions.clone();
+    tokio::spawn(async move {
+        // 1) Initial role chunk.
+        let init = chunk(&id, created, &model, Some(json!({"role":"assistant"})), None);
+        if tx.send(Ok(sse_data(&init))).await.is_err() { return; }
+
+        // 2) Stream event digests until terminal or timeout.
+        let mut events = BroadcastStream::new(bus_rx);
+        let started = Instant::now();
+        let mut terminated = false;
+        let mut finish_reason: Option<&'static str> = None;
+
+        loop {
+            // Poll mission status every 500ms so we still terminate cleanly
+            // even when the broadcast channel is quiet.
+            tokio::select! {
+                maybe_env = events.next() => {
+                    match maybe_env {
+                        Some(Ok(env)) => {
+                            if let Some(delta) = event_to_delta(&env, mid) {
+                                let ch = chunk(&id, created, &model, Some(json!({"content": delta})), None);
+                                if tx.send(Ok(sse_data(&ch))).await.is_err() { return; }
+                            }
+                        }
+                        Some(Err(_)) => { /* lagged — drop */ }
+                        None => break, // broadcast closed
+                    }
+                }
+                _ = tokio::time::sleep(MISSION_POLL_INTERVAL) => {}
+            }
+
+            // Check terminal condition via detail().
+            if let Ok(detail) = missions.detail(mid).await {
+                if is_terminal(&detail.mission.status) {
+                    finish_reason = Some(match detail.mission.status {
+                        MissionStatus::Completed => "stop",
+                        MissionStatus::Failed    => "error",
+                        MissionStatus::Cancelled => "cancelled",
+                        _                        => "stop",
+                    });
+                    // Emit a final summary chunk so a client that ignores
+                    // per-event deltas still gets the outcome.
+                    let mut summary = format!("\n\nMission {:?}.\n", detail.mission.status);
+                    for g in &detail.goals {
+                        summary.push_str(&format!("• [{:?}] {}\n", g.status, g.title));
+                    }
+                    let ch = chunk(&id, created, &model, Some(json!({"content": summary})), None);
+                    let _ = tx.send(Ok(sse_data(&ch))).await;
+                    terminated = true;
+                    break;
+                }
+            }
+
+            if started.elapsed() > MISSION_POLL_TIMEOUT {
+                finish_reason = Some("length");
+                let msg = format!(
+                    "\n\nMission did not terminate within {}s. Poll /missions/{} for progress.\n",
+                    MISSION_POLL_TIMEOUT.as_secs(), mid.as_uuid()
+                );
+                let ch = chunk(&id, created, &model, Some(json!({"content": msg})), None);
+                let _ = tx.send(Ok(sse_data(&ch))).await;
+                terminated = true;
+                break;
+            }
+        }
+
+        // 3) Final finish_reason chunk.
+        let fr = finish_reason.unwrap_or(if terminated { "stop" } else { "error" });
+        let final_ch = chunk(&id, created, &model, Some(json!({})), Some(fr.to_string()));
+        let _ = tx.send(Ok(sse_data(&final_ch))).await;
+
+        // 4) The OpenAI sentinel — a data-only frame with `[DONE]`.
+        let done = SseEvent::default().data("[DONE]");
+        let _ = tx.send(Ok(done)).await;
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Build a single `chat.completion.chunk` JSON blob.
+fn chunk(
+    id:      &str,
+    created: i64,
+    model:   &str,
+    delta:   Option<serde_json::Value>,
+    finish:  Option<String>,
+) -> serde_json::Value {
+    json!({
+        "id":      id,
+        "object":  "chat.completion.chunk",
+        "created": created,
+        "model":   model,
+        "choices": [{
+            "index":         0,
+            "delta":         delta.unwrap_or_else(|| json!({})),
+            "finish_reason": finish,
+        }],
+    })
+}
+
+fn sse_data(v: &serde_json::Value) -> SseEvent {
+    // OpenAI clients don't consume `event:` or `id:` — just `data:`. Keep it
+    // minimal so we're maximally compatible.
+    SseEvent::default().data(v.to_string())
+}
+
+/// Distil a ForgeEvent into a short human-readable delta, or return None to
+/// skip it entirely. We only forward events that meaningfully advance the
+/// mission — heartbeat/verbose ones are filtered so clients don't drown.
+fn event_to_delta(env: &EventEnvelope, mid: MissionId) -> Option<String> {
+    // Only forward events tied to *our* mission.
+    let ev_mid = match &env.event {
+        ForgeEvent::MissionPlanningStarted { id }
+        | ForgeEvent::MissionPlanningCompleted { id, .. }
+        | ForgeEvent::MissionPlanningFailed { id, .. }
+        | ForgeEvent::MissionStatusChanged { id, .. } => Some(*id),
+        ForgeEvent::SkillsSelected { mission_id, .. }
+        | ForgeEvent::ReplanRequested { mission_id, .. }
+        | ForgeEvent::PlanRevised { mission_id, .. } => Some(*mission_id),
+        _ => None,
+    };
+    if ev_mid? != mid { return None; }
+    Some(match &env.event {
+        ForgeEvent::MissionPlanningStarted { .. } => "Planning...\n".to_string(),
+        ForgeEvent::MissionPlanningCompleted { goal_count, .. } =>
+            format!("Planned {goal_count} goal(s).\n"),
+        ForgeEvent::MissionPlanningFailed { error, .. } =>
+            format!("Planning failed: {error}\n"),
+        ForgeEvent::MissionStatusChanged { from, to, .. } =>
+            format!("Status: {from:?} -> {to:?}\n"),
+        ForgeEvent::SkillsSelected { skill_names, .. } if !skill_names.is_empty() =>
+            format!("Selected skills: {}\n", skill_names.join(", ")),
+        ForgeEvent::ReplanRequested { iteration, .. } =>
+            format!("Replan #{iteration}...\n"),
+        ForgeEvent::PlanRevised { iteration, added_goals, .. } =>
+            format!("Replan #{iteration} added {added_goals} goal(s).\n"),
+        _ => return None,
+    })
 }
 
 /// Fold a chat history into `(title, description)`.

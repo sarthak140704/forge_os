@@ -234,3 +234,151 @@ fn cli_bundle_roundtrip() {
     let out = Command::new(&bin).args(["skill", "verify"]).arg(&bundle).output().unwrap();
     assert!(!out.status.success(), "tampered bundle should fail verify");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5f — plugin bundle roundtrip
+// ---------------------------------------------------------------------------
+#[test]
+fn cli_plugin_bundle_roundtrip() {
+    let bin = forge_bin();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. key + plugin source dir with mcp.yaml + a helper file
+    let key = tmp.path().join("id_ed25519");
+    Command::new(&bin).args(["keygen", "--out"]).arg(&key).output().unwrap();
+    let pubk = key.with_extension("pub");
+
+    let plugin_dir = tmp.path().join("my-plugin");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("mcp.yaml"),
+        "servers:\n  - name: fs\n    transport: stdio\n    command: npx\n    args: [\"-y\", \"mcp-fs\"]\n    enabled: true\n",
+    ).unwrap();
+    std::fs::write(plugin_dir.join("readme.md"), b"# my plugin").unwrap();
+
+    // 2. bundle
+    let bundle = tmp.path().join("my-plugin.forgebundle.json");
+    let out = Command::new(&bin)
+        .args(["plugin", "bundle"])
+        .arg(&plugin_dir)
+        .args(["--out"]).arg(&bundle)
+        .args(["--key"]).arg(&key)
+        .output().unwrap();
+    assert!(out.status.success(), "plugin bundle: {}", String::from_utf8_lossy(&out.stderr));
+
+    // 3. verify with pubkey → OK
+    let out = Command::new(&bin)
+        .args(["plugin", "verify"]).arg(&bundle)
+        .args(["--pubkey"]).arg(&pubk)
+        .output().unwrap();
+    assert!(out.status.success(), "plugin verify: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Plugin"), "verify should report kind=Plugin: {stdout}");
+
+    // 4. install
+    let dest = tmp.path().join("installed-plugin");
+    let out = Command::new(&bin)
+        .args(["plugin", "install"]).arg(&bundle)
+        .args(["--dest"]).arg(&dest)
+        .output().unwrap();
+    assert!(out.status.success(), "plugin install: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(dest.join("mcp.yaml").exists());
+    assert!(dest.join("readme.md").exists());
+
+    // 5. skill bundle command MUST refuse a plugin dir (no .md manifest, so
+    //    manifest is empty, but files should still be bundled — verify signature
+    //    verifies but kind field is absent). Just check the sign is a "skill"
+    //    round-trip: no `kind: plugin` in JSON output.
+    let bundle_as_skill = tmp.path().join("my-plugin-as-skill.forgebundle.json");
+    let _ = Command::new(&bin)
+        .args(["skill", "bundle"])
+        .arg(&plugin_dir)
+        .args(["--out"]).arg(&bundle_as_skill)
+        .args(["--key"]).arg(&key)
+        .output().unwrap();
+    if bundle_as_skill.exists() {
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bundle_as_skill).unwrap()).unwrap();
+        assert!(raw.get("kind").is_none() ||
+                raw.get("kind").and_then(|v| v.as_str()) == Some("skill"),
+                "skill-bundled dir must not carry kind=plugin");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5d — RBAC: read-only tokens
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_readonly_token_restricts_writes() {
+    // Boot with an extra read-only token.
+    unsafe { std::env::set_var("FORGE_API_READONLY_TOKENS", "ro-token-1,ro-token-2"); }
+    let bin = forge_bin();
+    let (_rt, addr, _tmp) = boot_server_on_ephemeral_port().await;
+    let url = format!("http://{addr}");
+    // Reset immediately so this env doesn't bleed into other tests.
+    unsafe { std::env::remove_var("FORGE_API_READONLY_TOKENS"); }
+
+    // 1. RO token can GET /health (though /health is unauth anyway)
+    let (code, _, _) = run_cli(&bin, &url, "ro-token-1", &["health"]);
+    assert_eq!(code, 0);
+
+    // 2. RO token can GET /missions
+    let (code, stdout, _) = run_cli(&bin, &url, "ro-token-1", &["missions", "list"]);
+    assert_eq!(code, 0, "RO token should list missions: {stdout}");
+
+    // 3. RO token CANNOT POST /missions — must exit non-zero
+    let (code, stdout, stderr) = run_cli(&bin, &url, "ro-token-1", &[
+        "missions", "create", "should-fail", "--description", "-", "--plan-only",
+    ]);
+    assert_ne!(code, 0, "RO token must NOT be able to create missions. stdout={stdout} stderr={stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(combined.contains("403") || combined.to_lowercase().contains("forbidden"),
+        "expected 403/forbidden in output: {combined}");
+
+    // 4. RO token CANNOT POST /v1/chat/completions
+    let (code, _, _) = run_cli(&bin, &url, "ro-token-1", &["chat", "hi"]);
+    assert_ne!(code, 0, "RO token must NOT be able to chat");
+
+    // 5. A totally unknown token → 401.
+    let (code, _, _) = run_cli(&bin, &url, "unknown-token", &["missions", "list"]);
+    assert_ne!(code, 0);
+
+    // 6. Full token still works.
+    let (code, _, _) = run_cli(&bin, &url, "t0p-secret", &[
+        "missions", "create", "full-works", "--description", "-", "--plan-only",
+    ]);
+    assert_eq!(code, 0, "full token must still be able to create missions");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5c — streaming shim (raw HTTP, no CLI wrapper needed).
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openai_streaming_shim_emits_chunks() {
+    let (_rt, addr, _tmp) = boot_server_on_ephemeral_port().await;
+    let url = format!("http://{addr}/v1/chat/completions");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build().unwrap();
+    let resp = client.post(&url)
+        .bearer_auth("t0p-secret")
+        .json(&serde_json::json!({
+            "model": "forge-mission",
+            "messages": [{"role":"user","content":"stream me"}],
+            "stream":   true,
+        }))
+        .send().await.expect("streaming POST");
+    assert!(resp.status().is_success(), "expected 200, got {}", resp.status());
+    let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    assert!(ctype.starts_with("text/event-stream"), "expected SSE content-type: {ctype}");
+
+    let body = resp.text().await.expect("body");
+    // Must have at least one data: frame and terminate with [DONE].
+    assert!(body.contains("data: {"), "expected data JSON frames:\n{body}");
+    assert!(body.contains("data: [DONE]"), "expected [DONE] sentinel:\n{body}");
+
+    // Must include at least one chat.completion.chunk envelope.
+    assert!(body.contains("chat.completion.chunk"), "expected chunk envelope:\n{body}");
+}

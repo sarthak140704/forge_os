@@ -111,6 +111,14 @@ enum Cmd {
         op: cmd::skill::Op,
     },
 
+    /// Signed MCP plugin bundles for sharing (Phase 5f). Same subcommands
+    /// as `skill`, but expects `mcp.yaml` or `plugin.yaml` as the manifest
+    /// source. On install, defaults to `./active/plugins/`.
+    Plugin {
+        #[command(subcommand)]
+        op: cmd::skill::Op,
+    },
+
     /// Generate an ed25519 keypair for bundle signing.
     Keygen {
         /// Where to write the private key (base64-encoded ed25519 secret).
@@ -146,6 +154,7 @@ async fn main() -> Result<()> {
             cmd::chat::run(&client, cli.json, model, system, prompt).await
         }
         Cmd::Skill { op } => cmd::skill::dispatch(cli.json, op).await,
+        Cmd::Plugin { op } => cmd::skill::dispatch_kind(bundle::BundleKind::Plugin, cli.json, op).await,
         Cmd::Keygen { out } => bundle::keygen(&out),
     }
 }

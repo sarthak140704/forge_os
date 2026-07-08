@@ -15,6 +15,7 @@ members = [
     "crates/forge-runtime",
     "crates/forge-server",
     "apps/forge-cli",
+    "apps/forge-gateway",
     "apps/forge-desktop/src-tauri",
 ]
 

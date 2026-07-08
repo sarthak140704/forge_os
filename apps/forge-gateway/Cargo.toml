@@ -1,0 +1,30 @@
+[package]
+name        = "forge-gateway"
+version     = { workspace = true }
+edition     = { workspace = true }
+description = "Webhook-to-chat bridge for Forge OS (Slack + generic)"
+license     = { workspace = true }
+
+[[bin]]
+name = "forge-gateway"
+path = "src/main.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+tokio              = { workspace = true }
+axum               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+serde_urlencoded   = "0.7"
+reqwest            = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap               = { workspace = true }
+sha2               = { workspace = true }
+hex                = { workspace = true }
+hmac               = "0.12"
+time               = { workspace = true }
+
+[dev-dependencies]
+tokio      = { workspace = true }
+reqwest    = { workspace = true }

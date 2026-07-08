@@ -42,11 +42,11 @@ events into a live React Flow DAG viewer.
 - **Curator**: automated skill deprecation, dedupe, merge. ✓ landed (Phase 4c)
 
 ## Phase 5 — Ecosystem
-- **Marketplace**: signed skill & plugin bundles. ✓ landed *signed skill bundles* (Phase 5b — `forge skill bundle|verify|install` with ed25519 signatures + `forge keygen`; distribution registry / discovery UX is deferred). *Signed plugin bundles* still open.
-- **Team edition**: multi-user missions, RBAC, org-level policies.
-- **API server**: OpenAI-compatible endpoint (like Hermes) so any frontend can drive Forge. ✓ landed as loopback HTTP + bearer + SSE + non-streaming OpenAI-compat shim (Phase 5a). TLS + RBAC + streaming shim + WebSocket transport are deferred.
+- **Marketplace**: signed skill & plugin bundles. ✓ landed *signed skill bundles* (Phase 5b — `forge skill bundle|verify|install` with ed25519 signatures + `forge keygen`) and *signed plugin bundles* (Phase 5f — `forge plugin bundle|verify|install`, accepts `mcp.yaml`/`plugin.yaml` manifests, kind stored in the signed payload). Distribution registry / discovery UX still deferred.
+- **Team edition**: multi-user missions, RBAC, org-level policies. ✓ landed *RBAC v1* (Phase 5d — two-role split: Full tokens (env `FORGE_API_TOKEN`) can do everything; ReadOnly tokens (comma-separated `FORGE_API_READONLY_TOKENS`) can only GET). Multi-user missions + org-level policies still deferred.
+- **API server**: OpenAI-compatible endpoint (like Hermes) so any frontend can drive Forge. ✓ landed as loopback HTTP + bearer + SSE + OpenAI-compat shim (Phase 5a) with streaming `chat.completion.chunk` frames (Phase 5c). TLS + per-user auth + WebSocket transport are deferred.
 - **Headless CLI**: `forge` binary wrapping the API. ✓ landed (Phase 5b — all subcommands + signed skill bundles + integration test).
-- **Messaging gateway**: reuse or wrap Hermes gateway (Telegram/Slack/etc.).
+- **Messaging gateway**: reuse or wrap Hermes gateway (Telegram/Slack/etc.). ✓ landed (Phase 5e — `forge-gateway` binary; Slack slash-command receiver with HMAC-verified signatures + `POST /webhook` generic bearer-protected endpoint. Discord/Telegram are additional adapters.)
 - **ACP editor integration**: VS Code, Zed, JetBrains. ✓ landed *VS Code extension* (Phase 5b — health / run mission / send-selection-as-chat via OpenAI shim). Zed / JetBrains still open.
 - **Voice mode, image gen, TTS, browser automation** (all deferred from spec §Media & Web).
 

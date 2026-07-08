@@ -1301,8 +1301,139 @@ Run in this order. Any FAIL → don't ship.
 | 19 | TC-P5-01/02/03 (HTTP API + SSE end-to-end from host tools) | UI+backend | 2 min |
 | 20 | TC-P5B-02/04 (forge CLI missions + skill bundles) | UI+backend | 2 min |
 | 21 | TC-P5B-06 (VS Code extension smoke) | UI+backend | 2 min |
+| 22 | TC-P5C-01 (streaming SSE from `/v1/chat/completions`) | Runnable | 30 s |
+| 23 | TC-P5D-01/02/03 (RBAC: RO can list, cannot create/chat; unknown token 401) | Runnable | 1 min |
+| 24 | TC-P5E-01/02/03 (gateway health + signed Slack + generic webhook) | Runnable | 2 min |
+| 25 | TC-P5F-01/02 (plugin bundle sign + verify + install) | Runnable | 30 s |
 
 If all 10 pass, the system is verifiably working end-to-end: UI, IPC, event bus, persistence, LLM router, planner, executor, tools, policy, skills (load/select/validate/promote/rollback/retire/autopromote), reflection, cost tracking, checkpoints, MCP, materializer.
+
+---
+
+# Phase 5c/5d/5e/5f — Streaming shim + RBAC + Gateway + Plugin bundles
+
+## TC-P5C-01 · `/v1/chat/completions` honours `stream: true`
+
+**Setup** — desktop running with `FORGE_API_TOKEN=s3cr3t`.
+
+**Prompt** (PowerShell):
+
+```powershell
+curl.exe -N --http1.1 `
+  -H "Authorization: Bearer s3cr3t" `
+  -H "Content-Type: application/json" `
+  -H "Accept: text/event-stream" `
+  --data-raw '{"model":"forge","stream":true,"messages":[{"role":"user","content":"tiny test"}]}' `
+  http://127.0.0.1:7823/v1/chat/completions
+```
+
+**Pass criteria:**
+- Response headers include `content-type: text/event-stream`.
+- Body contains at least one `data: {"id":"...","object":"chat.completion.chunk"...}` frame.
+- Stream ends with `data: [DONE]` on its own line.
+- Automated equivalent: `cargo test -p forge-cli --test end_to_end openai_streaming_shim_emits_chunks -- --exact`.
+
+## TC-P5D-01 · ReadOnly token can list missions
+
+```powershell
+$env:FORGE_API_TOKEN            = "s3cr3t"
+$env:FORGE_API_READONLY_TOKENS  = "ro-token-1,ro-token-2"
+# restart desktop so the env is picked up
+
+# Then, from another shell:
+curl.exe -sS -H "Authorization: Bearer ro-token-1" http://127.0.0.1:7823/missions
+# → 200 OK, JSON array
+```
+
+## TC-P5D-02 · ReadOnly token cannot create missions
+
+```powershell
+curl.exe -sS -o - -w "`nHTTP %{http_code}`n" `
+  -X POST `
+  -H "Authorization: Bearer ro-token-1" `
+  -H "Content-Type: application/json" `
+  --data-raw '{"objective":"nope","approval_mode":"auto","budget":{"llm_calls_max":1,"tool_calls_max":1,"wallclock_seconds_max":1}}' `
+  http://127.0.0.1:7823/missions
+# → HTTP 403, body contains "forbidden" or "requires a full-access token"
+```
+
+Same behaviour for `POST /missions/{id}/cancel`, `/missions/{id}/extend`, and `POST /v1/chat/completions`.
+
+## TC-P5D-03 · Unknown token still 401s
+
+```powershell
+curl.exe -sS -o - -w "`nHTTP %{http_code}`n" `
+  -H "Authorization: Bearer nope" http://127.0.0.1:7823/missions
+# → HTTP 401
+```
+
+Automated equivalent for all three: `cargo test -p forge-cli --test end_to_end cli_readonly_token_restricts_writes -- --exact`.
+
+## TC-P5E-01 · Gateway `/health`
+
+```powershell
+cargo run -p forge-gateway
+# in another shell:
+curl.exe -sS http://127.0.0.1:7824/health
+# → {"status":"ok"}
+```
+
+## TC-P5E-02 · Gateway `/webhook` requires shared secret
+
+```powershell
+$env:GATEWAY_SHARED_SECRET = "shh"
+$env:FORGE_API_URL         = "http://127.0.0.1:7823"
+$env:FORGE_API_TOKEN       = "s3cr3t"
+cargo run -p forge-gateway
+
+# in another shell:
+curl.exe -sS -o - -w "`nHTTP %{http_code}`n" `
+  -X POST -H "Authorization: Bearer wrong" `
+  -H "Content-Type: application/json" `
+  --data-raw '{"prompt":"hello"}' `
+  http://127.0.0.1:7824/webhook
+# → HTTP 401
+
+curl.exe -sS -X POST -H "Authorization: Bearer shh" `
+  -H "Content-Type: application/json" `
+  --data-raw '{"prompt":"hello"}' `
+  http://127.0.0.1:7824/webhook
+# → 200 OK, JSON with a `response` field
+```
+
+## TC-P5E-03 · Slack signing-secret verifier
+
+Unit-tested; run:
+
+```powershell
+cargo test -p forge-gateway
+```
+
+Should print `4 passed; 0 failed`. Covers a valid signature, a tampered body (rejected), a stale timestamp (rejected), and the router-builds smoke.
+
+## TC-P5F-01 · Plugin bundle sign + verify
+
+```powershell
+$dir = New-TemporaryFile | ForEach-Object { Remove-Item $_; New-Item -ItemType Directory -Path $_.FullName }
+Set-Content "$dir\mcp.yaml" "servers: {}"
+Set-Content "$dir\readme.md" "# demo plugin"
+
+.\target\debug\forge.exe keygen $dir\priv.key
+.\target\debug\forge.exe plugin bundle $dir $dir\plugin.json $dir\priv.key
+.\target\debug\forge.exe plugin verify $dir\plugin.json --pubkey $dir\priv.key.pub
+# → "signature OK  (kind: Plugin)"
+```
+
+## TC-P5F-02 · Plugin install writes to `plugins/`
+
+```powershell
+$dest = New-TemporaryFile | ForEach-Object { Remove-Item $_; New-Item -ItemType Directory -Path $_.FullName }
+.\target\debug\forge.exe plugin install $dir\plugin.json --dest $dest
+Get-ChildItem -Recurse $dest
+# → should list the plugin subdirectory containing mcp.yaml + readme.md
+```
+
+Automated equivalent: `cargo test -p forge-cli --test end_to_end cli_plugin_bundle_roundtrip -- --exact`.
 
 ---
 

@@ -177,4 +177,8 @@ Next steps:
        forge --help
   5. Optional — VS Code extension:
        cd apps/forge-vscode && npm install && npm run compile   # then press F5 in VS Code
+  6. Optional — build the messaging gateway (Slack + generic webhook):
+       cargo install --path apps/forge-gateway
+       FORGE_TOKEN='<same as FORGE_API_TOKEN>' forge-gateway
+       # then POST http://127.0.0.1:7824/webhook with Bearer GATEWAY_SHARED_SECRET
 EOM

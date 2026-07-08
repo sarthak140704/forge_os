@@ -246,6 +246,11 @@ fn default_curator_interval_secs() -> u64 { 900 }
 fn default_worker_stale_secs() -> u64 { 120 }
 fn default_api_token_env() -> String { "FORGE_API_TOKEN".to_string() }
 
+/// Env-var name for comma-separated read-only bearer tokens (Phase 5d).
+/// Hard-coded because it's a security surface — a typo in a per-runtime
+/// override would silently disable RBAC.
+const READONLY_TOKENS_ENV: &str = "FORGE_API_READONLY_TOKENS";
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct LlmConfig {
     /// Ordered list of providers to try. First success wins.
@@ -742,10 +747,25 @@ impl Runtime {
                      Set the env var to a random secret before opening the bind to non-loopback traffic."
                 );
             }
-            let state = forge_server::ApiState::new(
+            // Read-only tokens (Phase 5d) — comma-separated, empties skipped.
+            let read_only_tokens: Vec<String> = std::env::var(READONLY_TOKENS_ENV)
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !read_only_tokens.is_empty() {
+                tracing::info!(
+                    count = read_only_tokens.len(),
+                    env = READONLY_TOKENS_ENV,
+                    "API server registered read-only tokens (GET-only access)"
+                );
+            }
+            let state = forge_server::ApiState::with_read_only_tokens(
                 missions.clone(),
                 events.clone(),
                 token,
+                read_only_tokens,
             );
             tokio::spawn(async move {
                 if let Err(e) = forge_server::serve(bind, state).await {

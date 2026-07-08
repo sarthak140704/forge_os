@@ -28,7 +28,8 @@
 //! ## What this DOESN'T do
 //!
 //! - No TLS termination (use a reverse proxy).
-//! - No user accounts / RBAC — Phase 5 team-edition item.
+//! - No user accounts. A minimal role split (Full vs ReadOnly) landed in
+//!   Phase 5d — see `Role` and `ApiConfig::read_only_tokens`.
 //! - No skills / secrets / checkpoints endpoints yet — MVP scope is missions
 //!   + events. Add follow-ups incrementally.
 
@@ -69,6 +70,12 @@ pub struct ApiConfig {
     /// disables auth entirely (WARN log + `X-Forge-Auth: disabled` header
     /// on every response) — for local dev only.
     pub token: String,
+
+    /// Additional tokens granting **ReadOnly** access. Any GET is allowed
+    /// with one of these; POSTs (create/cancel/extend/chat) are refused
+    /// with 403. Read-only tokens are ignored when `token` is empty
+    /// (auth disabled). Added in Phase 5d.
+    pub read_only_tokens: Vec<String>,
 }
 
 impl Default for ApiConfig {
@@ -76,8 +83,21 @@ impl Default for ApiConfig {
         Self {
             bind: "127.0.0.1:7823".parse().expect("localhost:7823 always parses"),
             token: String::new(),
+            read_only_tokens: Vec::new(),
         }
     }
+}
+
+/// Which surface a token can touch. Phase 5d — not a full-blown RBAC,
+/// just enough to hand out read-only tokens to observers (dashboards,
+/// monitoring bots) without exposing mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// May do everything: create/cancel/extend missions, chat, GETs.
+    Full,
+    /// May only issue GETs (/health, /missions, /missions/:id,
+    /// /events). Everything else -> 403.
+    ReadOnly,
 }
 
 #[derive(Clone)]
@@ -85,11 +105,32 @@ pub struct ApiState {
     pub missions: MissionService,
     pub events:   EventBus,
     pub token:    Arc<String>,
+    pub read_only_tokens: Arc<Vec<String>>,
 }
 
 impl ApiState {
     pub fn new(missions: MissionService, events: EventBus, token: String) -> Self {
-        Self { missions, events, token: Arc::new(token) }
+        Self {
+            missions,
+            events,
+            token: Arc::new(token),
+            read_only_tokens: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Full constructor (Phase 5d).
+    pub fn with_read_only_tokens(
+        missions: MissionService,
+        events: EventBus,
+        token: String,
+        read_only_tokens: Vec<String>,
+    ) -> Self {
+        Self {
+            missions,
+            events,
+            token: Arc::new(token),
+            read_only_tokens: Arc::new(read_only_tokens),
+        }
     }
 }
 
@@ -102,6 +143,8 @@ impl ApiState {
 pub enum ApiError {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("not found")]
@@ -116,6 +159,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (code, msg) = match &self {
             ApiError::Unauthorized      => (StatusCode::UNAUTHORIZED, self.to_string()),
+            ApiError::Forbidden(_)      => (StatusCode::FORBIDDEN,    self.to_string()),
             ApiError::BadRequest(_)     => (StatusCode::BAD_REQUEST,  self.to_string()),
             ApiError::NotFound          => (StatusCode::NOT_FOUND,    self.to_string()),
             ApiError::Mission(_)        => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
@@ -177,17 +221,38 @@ pub async fn serve(bind: SocketAddr, state: ApiState) -> Result<(), ApiError> {
 // Auth
 // ---------------------------------------------------------------------------
 
-fn check_auth(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
+/// Verify the bearer token and return which Role it carries.
+///
+/// - Empty `state.token` => auth disabled, everyone gets Full.
+/// - Bearer matches `state.token` (constant-time) => Full.
+/// - Bearer matches any of `state.read_only_tokens` => ReadOnly.
+/// - Otherwise => Unauthorized.
+pub(crate) fn check_auth(state: &ApiState, headers: &HeaderMap) -> Result<Role, ApiError> {
     if state.token.is_empty() {
-        return Ok(()); // auth disabled — WARN was logged at boot
+        return Ok(Role::Full); // auth disabled — WARN was logged at boot
     }
     let hv = headers.get(header::AUTHORIZATION).ok_or(ApiError::Unauthorized)?;
     let s  = hv.to_str().map_err(|_| ApiError::Unauthorized)?;
     let tok = s.strip_prefix("Bearer ").ok_or(ApiError::Unauthorized)?;
     if constant_time_eq(tok.as_bytes(), state.token.as_bytes()) {
-        Ok(())
-    } else {
-        Err(ApiError::Unauthorized)
+        return Ok(Role::Full);
+    }
+    for ro in state.read_only_tokens.iter() {
+        if constant_time_eq(tok.as_bytes(), ro.as_bytes()) {
+            return Ok(Role::ReadOnly);
+        }
+    }
+    Err(ApiError::Unauthorized)
+}
+
+/// Verify the token AND assert Full-scope. Any handler that mutates state
+/// must call this instead of `check_auth` alone.
+pub(crate) fn require_full(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
+    match check_auth(state, headers)? {
+        Role::Full     => Ok(()),
+        Role::ReadOnly => Err(ApiError::Forbidden(
+            "this endpoint requires a full-access token".into(),
+        )),
     }
 }
 
@@ -245,7 +310,7 @@ async fn create_mission(
     headers: HeaderMap,
     Json(body): Json<CreateMissionBody>,
 ) -> Result<Json<MissionIdBody>, ApiError> {
-    check_auth(&state, &headers)?;
+    require_full(&state, &headers)?;
     if body.title.trim().is_empty() {
         return Err(ApiError::BadRequest("title must be non-empty".into()));
     }
@@ -270,7 +335,7 @@ async fn list_missions(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<forge_domain::MissionSummary>>, ApiError> {
-    check_auth(&state, &headers)?;
+    let _role = check_auth(&state, &headers)?;
     Ok(Json(state.missions.list().await?))
 }
 
@@ -279,7 +344,7 @@ async fn get_mission(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<forge_mission::MissionDetail>, ApiError> {
-    check_auth(&state, &headers)?;
+    let _role = check_auth(&state, &headers)?;
     let mid = MissionId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid mission id".into()))?;
     match state.missions.detail(mid).await {
         Ok(d) => Ok(Json(d)),
@@ -295,7 +360,7 @@ async fn cancel_mission(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    check_auth(&state, &headers)?;
+    require_full(&state, &headers)?;
     let mid = MissionId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid mission id".into()))?;
     state.missions.cancel(mid).await?;
     Ok(StatusCode::ACCEPTED)
@@ -310,7 +375,7 @@ async fn extend_mission(
     Path(id): Path<String>,
     Json(body): Json<ExtendMissionBody>,
 ) -> Result<StatusCode, ApiError> {
-    check_auth(&state, &headers)?;
+    require_full(&state, &headers)?;
     if body.prompt.trim().is_empty() {
         return Err(ApiError::BadRequest("prompt must be non-empty".into()));
     }
@@ -338,7 +403,7 @@ async fn events_sse(
     headers: HeaderMap,
     Query(q): Query<EventsQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, axum::Error>>>, ApiError> {
-    check_auth(&state, &headers)?;
+    let _role = check_auth(&state, &headers)?;
 
     let rx = state.events.subscribe();
     let since = q.since.unwrap_or(0);

@@ -766,6 +766,73 @@ Fixed in `apps/forge-desktop/src-tauri/src/lib.rs` — `create_mission` now retu
 ---
 
 
+## Phase 5c/5d/5e/5f — Streaming shim + RBAC + Gateway + Plugin bundles (SHIPPED)
+
+Wrapped up the Phase-5 ecosystem tier in one push. Four independent shippables, all backed by tests.
+
+### 5c — OpenAI streaming shim
+
+`POST /v1/chat/completions` now honours `"stream": true`. Response is an `Sse<...>` of `chat.completion.chunk` frames matching the OpenAI wire format so `openai` / LangChain clients work unchanged.
+
+- New `streaming_completion(state, mid, model)` in `crates/forge-server/src/openai_compat.rs` — spawns a producer task, subscribes to the event bus via `BroadcastStream`, filters by mission id, and forwards planning / status / replan / skill-selected events as deltas.
+- `tokio::select!` between the broadcast stream and a 500 ms status poll so terminal-state detection still happens during quiet periods. 300 s hard timeout → `finish_reason: "length"`.
+- Frame order: initial `role: assistant` chunk → content chunks → final chunk with `finish_reason` → `data: [DONE]` sentinel.
+
+### 5d — RBAC (two-role token split)
+
+Two token classes so IDEs / dashboards can be granted read-only access without exposing mission creation.
+
+- `FORGE_API_TOKEN` — Full role. All GETs + all mutations.
+- `FORGE_API_READONLY_TOKENS` — comma-separated list. GET-only. Mutating routes return **403 Forbidden**.
+- New `Role { Full, ReadOnly }` + `require_full(...)` helper in `crates/forge-server/src/lib.rs`.
+- Wired: `create_mission`, `cancel_mission`, `extend_mission`, `chat_completions` all require full. `list_missions`, `get_mission`, `events_sse` accept either role.
+- `Runtime::boot` reads the env, calls `ApiState::with_read_only_tokens(...)`, and logs an INFO count when any RO tokens are present.
+
+### 5e — Messaging gateway (`forge-gateway` binary)
+
+New crate at `apps/forge-gateway/`. Axum bridge that speaks to Forge via the OpenAI shim and exposes:
+
+- `GET  /health` — trivial health check.
+- `POST /webhook` — generic bearer-guarded intake (`Authorization: Bearer $GATEWAY_SHARED_SECRET`).
+- `POST /slack/commands` — Slack slash-command receiver. Verifies `X-Slack-Signature` (HMAC-SHA256 over `v0:{ts}:{body}` with the signing secret; 5-minute replay window; constant-time compare). Acks ephemerally within Slack's 3 s deadline, then a background task calls Forge and POSTs the answer back to `response_url`.
+
+4 unit tests: signature verify OK / tampered body rejected / stale timestamp rejected / router builds. Discord + Telegram would slot in as ~50-line siblings of `slack_slash`.
+
+### 5f — Signed MCP plugin bundles
+
+Same signing pipeline as Phase-5b skill bundles, extended to carry an explicit `kind`:
+
+- New `enum BundleKind { Skill, Plugin }`. Serialized snake_case; both `Bundle.kind` and the internal `Signed.kind` are `Option<BundleKind>` with `skip_serializing_if = "Option::is_none"` — so **pre-5f skill bundles verify byte-identically** (a plain-skill signature does not include a `kind` field).
+- Plugin dirs must contain a top-level `mcp.yaml` OR `plugin.yaml` manifest; enforced by new `collect_plugin_files(dir)`.
+- New top-level CLI subcommand `forge plugin bundle|verify|install`, sharing dispatch code with `forge skill` via `dispatch_kind(kind, json, op)`. `verify` prints e.g. `signature OK  (kind: Plugin)`.
+
+### Files changed
+
+- `crates/forge-server/src/lib.rs` — `Role`, `ApiConfig.read_only_tokens`, `ApiState::with_read_only_tokens`, `require_full`, `Forbidden(String) → 403`. `check_auth` returns `Result<Role, ApiError>` and does constant-time compares.
+- `crates/forge-server/src/openai_compat.rs` — streaming branch in `chat_completions` (return type is now `Result<Response, ApiError>`), plus `streaming_completion` / `chunk` / `sse_data` / `event_to_delta` helpers.
+- `crates/forge-runtime/src/lib.rs` — module-const `READONLY_TOKENS_ENV = "FORGE_API_READONLY_TOKENS"`; `Runtime::boot` reads + splits + calls `ApiState::with_read_only_tokens`. Kept a hard-coded env var name to avoid touching the 16+ `RuntimeConfig { ... }` struct-literal sites elsewhere.
+- `apps/forge-cli/src/bundle.rs` — `BundleKind`, `Signed.kind`, `sign_bundle(..., BundleKind)`, `collect_plugin_files(...)`.
+- `apps/forge-cli/src/cmd/skill.rs` — `dispatch_kind(kind, json, op)` shared entry point.
+- `apps/forge-cli/src/main.rs` — `Cmd::Plugin { op: cmd::skill::Op }` variant.
+- `apps/forge-gateway/{Cargo.toml, src/main.rs}` — new crate; `hmac 0.12` + `serde_urlencoded 0.7` as direct deps.
+- `Cargo.toml` — added `apps/forge-gateway` to `[workspace] members`.
+- `apps/forge-cli/tests/end_to_end.rs` — added `cli_plugin_bundle_roundtrip`, `cli_readonly_token_restricts_writes`, `openai_streaming_shim_emits_chunks`. Full suite is now 5 tests, all green.
+- `scripts/install-{windows.ps1, macos.sh}` — added optional step 6 for `cargo install --path apps/forge-gateway`.
+
+### Verification
+
+```
+cargo test -p forge-cli --test end_to_end
+    test result: ok. 5 passed; 0 failed
+cargo test -p forge-gateway
+    test result: ok. 4 passed; 0 failed
+cargo check --workspace --tests --examples
+    Finished — no warnings, no errors
+```
+
+---
+
+
 
 
 **Stores** (`apps/forge-desktop/frontend/src/stores/`)
