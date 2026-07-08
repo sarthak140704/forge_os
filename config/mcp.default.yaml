@@ -1,0 +1,39 @@
+# Forge OS — MCP (Model Context Protocol) server configuration
+#
+# Each entry describes one MCP server for Forge to spawn on boot. All fields
+# are optional except `name` and `command`. The `${workspace_root}` token is
+# expanded to Forge's active workspace directory before spawn.
+#
+# A missing / empty file (like this one out-of-the-box) means MCP is off —
+# only the built-in tools are available. Enable a server by uncommenting its
+# entry and running once via `npx` / installing the target binary.
+#
+# ---- Popular servers (uncomment to enable) ----
+#
+# servers:
+#   # Filesystem: read/write within workspace_root.
+#   # Requires: node + `npm i -g @modelcontextprotocol/server-filesystem`
+#   #   (or use `npx -y ...` on demand as shown here).
+#   - name: filesystem
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "${workspace_root}"]
+#     enabled: true
+#
+#   # Git: run git commands against the workspace.
+#   # Requires: `pip install mcp-server-git` (or `pipx install ...`).
+#   - name: git
+#     transport: stdio
+#     command: python
+#     args: ["-m", "mcp_server_git", "--repository", "${workspace_root}"]
+#     enabled: true
+#
+#   # GitHub: authenticated GitHub API access.
+#   # Requires: GITHUB_PERSONAL_ACCESS_TOKEN env var set in Forge's process.
+#   - name: github
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     enabled: false
+
+servers: []

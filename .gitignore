@@ -1,0 +1,36 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node
+node_modules/
+apps/forge-desktop/frontend/dist/
+apps/forge-desktop/frontend/.vite/
+
+# Tauri
+apps/forge-desktop/src-tauri/gen/
+apps/forge-desktop/src-tauri/target/
+
+# Logs
+*.log
+.tauri.log
+tauri-dev.log
+tauri-dev.err.log
+cargo-check.log
+
+# Secrets — never commit
+*.key
+key.txt
+secrets.toml
+.env
+.env.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local session artifacts
+.forge/

@@ -1,0 +1,19 @@
+[package]
+name = "forge-planner"
+description = "LLM-backed mission planner: prompts an LLM to decompose a mission into a goal DAG."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+forge-domain = { workspace = true }
+forge-llm    = { workspace = true }
+forge-skills = { workspace = true }
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }

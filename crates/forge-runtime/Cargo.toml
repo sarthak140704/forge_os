@@ -1,0 +1,36 @@
+[package]
+name = "forge-runtime"
+description = "Composition root: boots persistence, events, LLM, tools, policy, planner, executor, mission service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+forge-domain      = { workspace = true }
+forge-events      = { workspace = true }
+forge-persistence = { workspace = true }
+forge-llm         = { workspace = true }
+forge-tools       = { workspace = true }
+forge-policy      = { workspace = true }
+forge-planner     = { workspace = true }
+forge-execution   = { workspace = true }
+forge-mission     = { workspace = true }
+forge-skills      = { workspace = true }
+forge-mcp         = { workspace = true }
+tokio             = { workspace = true }
+async-trait       = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber= { workspace = true }
+toml              = { workspace = true }
+keyring           = { workspace = true }
+sqlx              = { workspace = true }
+time              = { workspace = true }
+
+[dev-dependencies]
+uuid              = { workspace = true }
+tempfile          = { workspace = true }

@@ -1,0 +1,2 @@
+# Never rewrite line endings. Store bytes exactly as authored.
+* -text

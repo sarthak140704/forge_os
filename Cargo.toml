@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge-domain",
+    "crates/forge-events",
+    "crates/forge-persistence",
+    "crates/forge-llm",
+    "crates/forge-tools",
+    "crates/forge-policy",
+    "crates/forge-planner",
+    "crates/forge-execution",
+    "crates/forge-mission",
+    "crates/forge-skills",
+    "crates/forge-mcp",
+    "crates/forge-runtime",
+    "apps/forge-desktop/src-tauri",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.79"
+license      = "Apache-2.0"
+repository   = "https://github.com/t-sarverma/forge-os"
+authors      = ["Sarthak Verma"]
+
+[workspace.dependencies]
+# runtime
+tokio            = { version = "1.40", features = ["full"] }
+async-trait      = "0.1"
+futures          = "0.3"
+
+# data
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+uuid             = { version = "1", features = ["v4", "serde"] }
+time             = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+jsonschema       = { version = "0.18", default-features = false }
+
+# errors + logs
+thiserror        = "1"
+anyhow           = "1"
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# persistence
+sqlx             = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# http
+reqwest          = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# concurrency helpers
+dashmap          = "6"
+parking_lot      = "0.12"
+tokio-util       = { version = "0.7", features = ["rt"] }
+
+# secrets — OS keyring for API keys
+keyring          = { version = "3", features = ["windows-native", "apple-native", "linux-native-sync-persistent"] }
+
+# test-only
+tempfile         = "3"
+
+# config
+serde_yaml       = "0.9"
+toml             = "0.8"
+
+# internal
+forge-domain      = { path = "crates/forge-domain" }
+forge-events      = { path = "crates/forge-events" }
+forge-persistence = { path = "crates/forge-persistence" }
+forge-llm         = { path = "crates/forge-llm" }
+forge-tools       = { path = "crates/forge-tools" }
+forge-policy      = { path = "crates/forge-policy" }
+forge-planner     = { path = "crates/forge-planner" }
+forge-execution   = { path = "crates/forge-execution" }
+forge-mission     = { path = "crates/forge-mission" }
+forge-skills      = { path = "crates/forge-skills" }
+forge-mcp         = { path = "crates/forge-mcp" }
+forge-runtime     = { path = "crates/forge-runtime" }
+
+[profile.release]
+lto              = "thin"
+codegen-units    = 1
+strip            = true
+
+[profile.dev]
+opt-level        = 0
+debug            = 1

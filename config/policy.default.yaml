@@ -1,0 +1,18 @@
+# Forge OS — default policy.
+#
+# Phase-1 defaults: leave fs boundaries to the tool layer (`safe_resolve` in
+# `forge-tools/src/builtins.rs` canonicalises + rejects paths escaping the
+# workspace, so a policy rule against `workspace_root` prefix is redundant and
+# would incorrectly reject the relative paths the planner emits, like
+# `notes/README.md`).
+#
+# What we still enforce here: destructive shell commands must be explicitly
+# approved before they run. Add more rules as needed for your workflows.
+
+rules:
+  - name: approve_destructive_shell
+    when_tool: shell.run
+    deny_if_input_string_matches:
+      field: command
+      regex: "^(rm|del|rmdir|format|shutdown|reboot)"
+    on_fail: require_approval

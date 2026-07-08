@@ -1,0 +1,37 @@
+[package]
+name        = "forge-desktop"
+description = "Forge OS desktop shell (Tauri v2)."
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+authors.workspace     = true
+
+[lib]
+name = "forge_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri            = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow           = { workspace = true }
+time             = { workspace = true }
+forge-domain     = { workspace = true }
+forge-events     = { workspace = true }
+forge-mission    = { workspace = true }
+forge-persistence = { workspace = true }
+forge-runtime    = { workspace = true }
+forge-skills     = { workspace = true }
+sqlx             = { workspace = true }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
