@@ -31,14 +31,16 @@ const AUTHOR: &str = "Forge OS <forge@localhost>";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Checkpoint {
-    pub sha:         String,
-    pub short_sha:   String,
-    pub subject:     String,
-    pub timestamp:   String,
-    pub mission_id:  Option<String>,
-    pub task_id:     Option<String>,
-    pub tool:        Option<String>,
+    pub sha:           String,
+    pub short_sha:     String,
+    pub subject:       String,
+    pub timestamp:     String,
+    pub mission_id:    Option<String>,
+    pub task_id:       Option<String>,
+    pub tool:          Option<String>,
     pub files_changed: usize,
+    pub insertions:    usize,
+    pub deletions:     usize,
 }
 
 /// Thin wrapper around `git` CLI, sequenced through a mutex so concurrent
@@ -196,11 +198,15 @@ impl CheckpointStore {
     pub async fn list(&self, limit: usize, mission_id: Option<&str>) -> Result<Vec<Checkpoint>, String> {
         if !self.enabled { return Ok(vec![]); }
         let _guard = self.lock.lock().await;
-        // Format: <sha>\x1f<short>\x1f<subject>\x1f<iso date>\x1f<body>\x1e
+        // Record separator LEADS each record (rather than trailing) so that
+        // `--shortstat` output (which git emits AFTER the format template
+        // for each commit) lands INSIDE the same record's tail, not spilled
+        // into the next record's leading text.
+        // Layout per record: `\x1e` + <sha>\x1f<short>\x1f<subject>\x1f<iso date>\x1f<body>\n<shortstat>
         let out = self.base_cmd()
             .arg("log")
             .arg(format!("-n{}", limit.max(1)))
-            .arg("--format=%H\x1f%h\x1f%s\x1f%aI\x1f%b\x1e")
+            .arg("--format=\x1e%H\x1f%h\x1f%s\x1f%aI\x1f%b")
             .arg("--shortstat")
             .output().map_err(|e| format!("git log: {e}"))?;
         if !out.status.success() {
@@ -217,20 +223,28 @@ impl CheckpointStore {
             let subject   = fields.next().unwrap_or("").trim().to_string();
             let ts        = fields.next().unwrap_or("").trim().to_string();
             let tail      = fields.next().unwrap_or("");
-            if sha.is_empty() { continue; }
+            if sha.len() != 40 { continue; }
             let mut mid = None;
             let mut tid = None;
             let mut tool = None;
             let mut files_changed = 0usize;
+            let mut insertions = 0usize;
+            let mut deletions = 0usize;
             for line in tail.lines() {
                 let l = line.trim();
                 if let Some(v) = l.strip_prefix("Forge-Mission-Id:") { mid = Some(v.trim().to_string()); }
                 else if let Some(v) = l.strip_prefix("Forge-Task-Id:")    { tid = Some(v.trim().to_string()); }
                 else if let Some(v) = l.strip_prefix("Forge-Tool:")       { tool = Some(v.trim().to_string()); }
-                else if l.contains("file changed") || l.contains("files changed") {
+                else if l.contains("changed,") || l.contains("changed\n") || (l.contains("file") && l.contains("changed")) {
                     // e.g. " 2 files changed, 8 insertions(+), 1 deletion(-)"
-                    if let Some(n) = l.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()) {
-                        files_changed = n;
+                    //   or " 1 file changed, 1 insertion(+)"
+                    //   or " 1 file changed, 1 deletion(-)"
+                    for part in l.split(',') {
+                        let p = part.trim();
+                        let n = p.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                        if p.contains("file")        { files_changed = n; }
+                        else if p.contains("insertion") { insertions = n; }
+                        else if p.contains("deletion")  { deletions = n; }
                     }
                 }
             }
@@ -239,7 +253,8 @@ impl CheckpointStore {
             }
             result.push(Checkpoint {
                 sha, short_sha, subject, timestamp: ts,
-                mission_id: mid, task_id: tid, tool, files_changed,
+                mission_id: mid, task_id: tid, tool,
+                files_changed, insertions, deletions,
             });
         }
         Ok(result)
@@ -313,6 +328,39 @@ mod tests {
         // Nothing changed since the init commit.
         let sha = store.commit("noop", None, None, None).await.unwrap();
         assert!(sha.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_populates_files_and_line_counts() {
+        if !git_available() { return; }
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        let git_dir = tmp.path().join("shadow").join(".git");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = CheckpointStore::init(workspace.clone(), git_dir);
+
+        // First commit — 2 lines added.
+        std::fs::write(workspace.join("a.txt"), "line1\nline2\n").unwrap();
+        store.commit("v1", None, None, Some("fs.write")).await.unwrap();
+
+        // Second commit — modify one file (net +1 line) and add another.
+        std::fs::write(workspace.join("a.txt"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(workspace.join("b.txt"), "hello").unwrap();
+        store.commit("v2", None, None, Some("fs.write")).await.unwrap();
+
+        let list = store.list(10, None).await.unwrap();
+        // Newest first.
+        let v2 = &list[0];
+        assert_eq!(v2.subject, "v2");
+        assert_eq!(v2.files_changed, 2, "v2 should touch 2 files, got {:?}", v2);
+        assert!(v2.insertions >= 2, "v2 should show >= 2 insertions, got {:?}", v2);
+
+        let v1 = &list[1];
+        assert_eq!(v1.subject, "v1");
+        assert_eq!(v1.files_changed, 1, "v1 should touch 1 file, got {:?}", v1);
+        assert_eq!(v1.insertions, 2, "v1 should show 2 insertions, got {:?}", v1);
+        assert_eq!(v1.deletions, 0);
+        assert_eq!(v1.tool.as_deref(), Some("fs.write"));
     }
 
     #[tokio::test]

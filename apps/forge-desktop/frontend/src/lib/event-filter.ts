@@ -29,6 +29,7 @@ export function eventMissionId(
     case "episodic_recall_surfaced":
       return ev.mission_id;
     case "checkpoint_created":
+    case "checkpoint_skipped":
       return ev.mission_id ?? null;
     // Goal-scoped
     case "goal_created":
@@ -77,7 +78,7 @@ export type EventCategory = "mission" | "goal" | "task" | "llm" | "plugin" | "me
 
 export function eventCategory(ev: ForgeEvent): EventCategory {
   const t = ev.type;
-  if (t.startsWith("mission_cost") || t.startsWith("mission_reflection") || t.startsWith("skill_proposal") || t.startsWith("skills_selected") || t.startsWith("replan_") || t === "plan_revised" || t === "episodic_recall_surfaced" || t === "checkpoint_created") return "meta";
+  if (t.startsWith("mission_cost") || t.startsWith("mission_reflection") || t.startsWith("skill_proposal") || t.startsWith("skills_selected") || t.startsWith("replan_") || t === "plan_revised" || t === "episodic_recall_surfaced" || t === "checkpoint_created" || t === "checkpoint_skipped") return "meta";
   if (t.startsWith("mission_")) return "mission";
   if (t.startsWith("goal_")) return "goal";
   if (t.startsWith("task_") || t === "tool_invoked" || t.startsWith("policy_")) return "task";

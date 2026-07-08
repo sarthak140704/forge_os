@@ -41,6 +41,7 @@ function summarize(e: ForgeEvent): string {
     case "mission_cost_summary": return `Cost summary: ${e.llm_calls} calls, ${e.prompt_tokens}+${e.completion_tokens} tok, ${e.total_latency_ms}ms`;
     case "episodic_recall_surfaced": return `Episodic recall: ${e.prior_count} prior mission${e.prior_count === 1 ? "" : "s"} (kw: ${e.keywords.slice(0, 5).join(", ")})`;
     case "checkpoint_created": return `Checkpoint ${e.short_sha}: ${e.label}`;
+    case "checkpoint_skipped": return `Checkpoint no-op (${e.tool}): ${e.reason}`;
     case "mcp_server_started": return `MCP ${e.name} started (${e.tools.length} tools)`;
     case "mcp_server_failed": return `MCP ${e.name} failed: ${e.error}`;
     case "mcp_tool_invoked": return `MCP ${e.server}/${e.tool} invoked`;

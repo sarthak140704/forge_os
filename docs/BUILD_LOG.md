@@ -101,15 +101,21 @@ sqlite pool → repos → event bus → tool registry (+ MCP adapters) → LLM r
   - `pub struct CheckpointStore { workspace, git_dir, lock: Mutex, enabled }`
     - `init(workspace, git_dir) -> Self` (best-effort; disabled if git missing)
     - `commit(label, mission_id?, task_id?, tool?) -> Result<Option<String>, String>` — `None` = empty diff (no commit)
-    - `list(limit, mission_id_filter?) -> Vec<Checkpoint>` — parses `git log --format='%H\x1f%h\x1f%s\x1f%aI\x1f%b\x1e' --shortstat`
+    - `list(limit, mission_id_filter?) -> Vec<Checkpoint>` — parses `git log --format='\x1e%H\x1f%h\x1f%s\x1f%aI\x1f%b' --shortstat`. **Record separator LEADS the format**, not trails — otherwise the shortstat block that git prints AFTER each commit spills into the next record's leading text and files_changed/insertions/deletions all read 0.
     - `revert(sha) -> Result<(), String>` — `git reset --hard <sha> && git clean -fd` (destructive)
     - `is_enabled() -> bool`
-- **Auto-snapshot**: `Runtime::boot()` spawns a task subscribing to the event bus. On `ForgeEvent::TaskCompleted` looks up task → tool via `TaskRepository::get()`, then goal → mission via `GoalRepository::get()`. If `is_mutating_tool(&tool)` returns true → `cp.commit(...)` and emit `ForgeEvent::CheckpointCreated { sha, short_sha, tool, mission_id, task_id, label }` (this is what the timeline shows).
+- **Auto-snapshot**: `Runtime::boot()` spawns a task subscribing to the event bus. On `ForgeEvent::TaskCompleted` looks up task → tool via `TaskRepository::get()`, then goal → mission via `GoalRepository::get()`. If `is_mutating_tool(&tool)` returns true → `cp.commit(...)`:
+  - `Ok(Some(sha))` → emit `ForgeEvent::CheckpointCreated { sha, short_sha, tool, mission_id, task_id, label }`
+  - `Ok(None)` (no workspace changes — e.g. identical bytes re-written) → emit `ForgeEvent::CheckpointSkipped { tool, mission_id, task_id, reason }` so the timeline shows explicit "no-op" feedback instead of silently swallowing the attempt.
 - **`is_mutating_tool(name)`** — hot path filter:
   - Local: `fs.write | fs.mkdir | fs.append | fs.delete | fs.move | shell.run`
   - MCP: `mcp.*` where name contains `write | create_directory | edit | move | delete | append | mkdir | rename`
   - **Actual tool names in registry**: `fs.read`, `fs.write`, `fs.mkdir`, `fs.list`, `shell.run` (`crates/forge-tools/src/builtins.rs`) and `mcp.<server>.<remote>` (`crates/forge-mcp/src/adapter.rs:57`). Do NOT match `file_write` / `create_directory` — those aren't real names.
-- **Tests**: `checkpoints::tests::{empty_commit_returns_none, init_and_commit_and_list_roundtrip, revert_restores_file_contents}` — all pass, skip on machines without git.
+- **Tests**: `checkpoints::tests::{empty_commit_returns_none, init_and_commit_and_list_roundtrip, list_populates_files_and_line_counts, revert_restores_file_contents}` — all 4 pass, skip on machines without git.
+- **Headless smokes** (no LLM tokens spent, no UI required):
+  - `cargo run -p forge-runtime --example checkpoints_headless_smoke` — injects synthetic mission/goal/task via `Runtime::{goals,tasks}` public repos and publishes `TaskCompleted` directly. Asserts `CheckpointCreated` fires on new content and `CheckpointSkipped` fires on duplicate content.
+  - `cargo run -p forge-runtime --example checkpoints_smoke` — full end-to-end via the planner LLM; useful when the Groq quota isn't exhausted.
+- **Runtime exposes** `pub goals: Arc<SqliteGoalRepository>` and `pub tasks: Arc<SqliteTaskRepository>` so headless drivers and integration tests can seed the DB without going through the planner.
 - **IPC**: `list_checkpoints(mission_id?, limit?) -> Vec<Checkpoint>`; `revert_checkpoint(sha)`.
 
 ### Secrets — `crates/forge-runtime/src/secrets.rs`

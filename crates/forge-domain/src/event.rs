@@ -119,6 +119,17 @@ pub enum ForgeEvent {
         task_id:    Option<TaskId>,
         label:      String,
     },
+
+    /// A mutating tool ran but the shadow-git store found no workspace
+    /// changes to commit (e.g. the same bytes were re-written). Surfaced so
+    /// the UI can show clear "no-op" feedback instead of silently swallowing
+    /// the auto-snapshot attempt.
+    CheckpointSkipped {
+        tool:       String,
+        mission_id: Option<MissionId>,
+        task_id:    Option<TaskId>,
+        reason:     String,
+    },
 }
 
 impl ForgeEvent {
@@ -163,6 +174,7 @@ impl ForgeEvent {
             McpToolInvoked { server, tool, .. } => format!("mcp_{server}_{tool}"),
 
             CheckpointCreated { sha, .. } => format!("checkpoint_{sha}"),
+            CheckpointSkipped { task_id, .. } => task_id.map(|t| t.to_string()).unwrap_or_else(|| "checkpoint_skip".into()),
         }
     }
 
@@ -201,6 +213,7 @@ impl ForgeEvent {
             | McpToolInvoked { .. } => AggregateKind::Plugin,
 
             CheckpointCreated { .. } => AggregateKind::Mission,
+            CheckpointSkipped { .. } => AggregateKind::Mission,
         }
     }
 
@@ -241,6 +254,7 @@ impl ForgeEvent {
             MissionCostSummary { .. } => "mission_cost_summary",
             EpisodicRecallSurfaced { .. } => "episodic_recall_surfaced",
             CheckpointCreated { .. } => "checkpoint_created",
+            CheckpointSkipped { .. } => "checkpoint_skipped",
         }
     }
 }

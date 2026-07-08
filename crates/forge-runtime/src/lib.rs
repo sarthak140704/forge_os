@@ -223,6 +223,13 @@ pub struct Runtime {
     /// Shadow-git checkpoint store. Snapshots the workspace after each
     /// mutating task so `revert_checkpoint` can undo any change.
     pub checkpoints: CheckpointStore,
+
+    /// Goal repository. Exposed for headless drivers/tests that need to
+    /// insert synthetic mission/goal/task chains and publish events directly
+    /// against the runtime's bus.
+    pub goals: Arc<SqliteGoalRepository>,
+    /// Task repository. See `goals` above for rationale.
+    pub tasks: Arc<SqliteTaskRepository>,
 }
 
 impl Runtime {
@@ -526,7 +533,18 @@ impl Runtime {
                                         label,
                                     }).await;
                                 }
-                                Ok(None)       => { /* no changes to commit; harmless */ }
+                                Ok(None)       => {
+                                    // No workspace changes — surface this so
+                                    // the UI can show "no-op" feedback instead
+                                    // of silently swallowing the attempt.
+                                    tracing::info!(tool = %tool, "checkpoint skipped: no changes");
+                                    let _ = events_ck.publish(ForgeEvent::CheckpointSkipped {
+                                        tool: tool.clone(),
+                                        mission_id: mid_parsed,
+                                        task_id,
+                                        reason: "no workspace changes to commit".into(),
+                                    }).await;
+                                }
                                 Err(e)         => tracing::warn!(err = %e, tool = %tool, "checkpoint failed"),
                             }
                         }
@@ -539,7 +557,7 @@ impl Runtime {
             });
         }
 
-        Ok(Self { config, pool, events, missions, tools, llm, mcp, checkpoints })
+        Ok(Self { config, pool, events, missions, tools, llm, mcp, checkpoints, goals: goals_repo, tasks: tasks_repo })
     }
 }
 

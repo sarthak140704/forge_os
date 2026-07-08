@@ -95,6 +95,7 @@ export type ForgeEvent =
   | { type: "mission_cost_summary"; mission_id: string; llm_calls: number; prompt_tokens: number; completion_tokens: number; total_latency_ms: number }
   | { type: "episodic_recall_surfaced"; mission_id: string; keywords: string[]; prior_count: number; block_preview: string }
   | { type: "checkpoint_created"; sha: string; short_sha: string; tool: string; mission_id?: string | null; task_id?: string | null; label: string }
+  | { type: "checkpoint_skipped"; tool: string; mission_id?: string | null; task_id?: string | null; reason: string }
   | { type: "mcp_server_started"; name: string; tools: string[] }
   | { type: "mcp_server_failed"; name: string; error: string }
   | { type: "mcp_tool_invoked"; server: string; tool: string; task_id?: string | null };
