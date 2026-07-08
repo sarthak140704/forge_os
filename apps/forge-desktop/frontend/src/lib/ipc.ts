@@ -194,3 +194,46 @@ export async function runCurator(): Promise<CuratorSuggestion[]> {
 export async function curatorScan(apply: boolean): Promise<CuratorReport> {
   return invoke<CuratorReport>("curator_scan", { apply });
 }
+
+// ---- Phase 4d/4f: mission queue + org memory ----
+
+export interface MissionQueueRow {
+  id: number;
+  mission_id: string;
+  status: "queued" | "claimed" | "done" | "failed";
+  claimed_by: string | null;
+  claimed_at: string | null;
+  heartbeat_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+  enqueued_at: string;
+}
+
+export interface QueueStatus {
+  workers: number;
+  queued: number;
+  claimed: number;
+  recent: MissionQueueRow[];
+}
+
+export interface OrgMemoryRow {
+  id: number;
+  key: string;
+  value: string;
+  tags: string[];
+  source_mission_id: string | null;
+  created_at: string;
+  retired_at: string | null;
+}
+
+export async function queueStatus(): Promise<QueueStatus> {
+  return invoke<QueueStatus>("queue_status");
+}
+
+export async function listOrgMemory(limit?: number): Promise<OrgMemoryRow[]> {
+  return invoke<OrgMemoryRow[]>("list_org_memory", { limit: limit ?? null });
+}
+
+export async function deleteOrgMemory(id: number): Promise<boolean> {
+  return invoke<boolean>("delete_org_memory", { id });
+}

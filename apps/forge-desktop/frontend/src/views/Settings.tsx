@@ -18,6 +18,9 @@ import {
   curatorScan,
   setSecret,
   validateSkillProposal,
+  queueStatus,
+  listOrgMemory,
+  deleteOrgMemory,
   type Checkpoint,
   type CuratorSuggestion,
   type CuratorReport,
@@ -25,6 +28,7 @@ import {
   type SkillProposalSummary,
   type SkillVersion,
   type ValidationReport,
+  type OrgMemoryRow,
 } from "@/lib/ipc";
 import { useUiStore } from "@/stores/ui";
 
@@ -59,6 +63,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
         <div className="flex-1 overflow-y-auto p-5 space-y-6">
           <SecretsSection />
+          <QueueSection />
+          <MemorySection />
           <CheckpointsSection />
           <SkillsSection />
           <AuditSection />
@@ -171,6 +177,146 @@ function SecretRow({
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ---------- Queue (Phase 4d) ----------
+
+function QueueSection() {
+  const qc = useQueryClient();
+  const status = useQuery({
+    queryKey: ["queue-status"],
+    queryFn: queueStatus,
+    refetchInterval: 4000,
+    refetchOnWindowFocus: false,
+  });
+
+  const invalidate = () => qc.invalidateQueries({ queryKey: ["queue-status"] });
+
+  const workers = status.data?.workers ?? 0;
+  const workersOn = workers > 0;
+
+  return (
+    <Section
+      title="Mission Queue"
+      hint={workersOn
+        ? `Worker pool active (${workers} workers). Missions can be enqueued for background execution and survive restarts.`
+        : "Worker pool disabled (workers=0 in RuntimeConfig). Missions still run inline via plan_and_run."}
+    >
+      {status.isLoading && <Muted>Loading…</Muted>}
+      {status.data && (
+        <>
+          <div className="flex items-center gap-3 mb-3">
+            <Badge tone={workersOn ? "success" : "info"}>
+              {workersOn ? `${workers} workers` : "inline mode"}
+            </Badge>
+            <span className="text-sm">
+              <span className="text-forge-muted">queued</span>{" "}
+              <span className="font-mono">{status.data.queued}</span>
+            </span>
+            <span className="text-sm">
+              <span className="text-forge-muted">claimed</span>{" "}
+              <span className="font-mono">{status.data.claimed}</span>
+            </span>
+            <div className="flex-1" />
+            <Button variant="ghost" onClick={invalidate}>Refresh</Button>
+          </div>
+          {status.data.recent.length === 0 ? (
+            <Muted>No recent queue entries.</Muted>
+          ) : (
+            <div className="space-y-1 max-h-64 overflow-y-auto">
+              {status.data.recent.map((row) => (
+                <div
+                  key={row.id}
+                  className="p-2 rounded border border-forge-border bg-forge-panel/40 text-xs font-mono flex items-center gap-2"
+                >
+                  <span className="text-forge-muted">#{row.id}</span>
+                  <Badge tone={queueTone(row.status)}>{row.status}</Badge>
+                  <span className="truncate flex-1" title={row.mission_id}>
+                    {row.mission_id.slice(0, 8)}…
+                  </span>
+                  <span className="text-forge-muted">
+                    {new Date(row.enqueued_at).toLocaleTimeString()}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </Section>
+  );
+}
+
+function queueTone(s: string): "info" | "success" | "warn" | "err" {
+  if (s === "done") return "success";
+  if (s === "failed") return "err";
+  if (s === "claimed") return "warn";
+  return "info";
+}
+
+// ---------- Organizational Memory (Phase 4f) ----------
+
+function MemorySection() {
+  const qc = useQueryClient();
+  const rows = useQuery({
+    queryKey: ["org-memory"],
+    queryFn: () => listOrgMemory(200),
+    refetchOnWindowFocus: false,
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => deleteOrgMemory(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["org-memory"] }),
+  });
+
+  return (
+    <Section
+      title="Organizational Memory"
+      hint="Insights promoted from mission reflections. Injected into every planner prompt as durable cross-mission context."
+    >
+      {rows.isLoading && <Muted>Loading…</Muted>}
+      {rows.data?.length === 0 && (
+        <Muted>
+          No memory yet. Complete a mission — its reflection insights are promoted here automatically.
+        </Muted>
+      )}
+      {rows.data && rows.data.length > 0 && (
+        <div className="space-y-2 max-h-80 overflow-y-auto">
+          {rows.data.map((row) => (
+            <MemoryRow
+              key={row.id}
+              row={row}
+              onDelete={() => {
+                if (confirm(`Retire memory #${row.id}?\n\n"${row.key}"`)) {
+                  del.mutate(row.id);
+                }
+              }}
+            />
+          ))}
+        </div>
+      )}
+    </Section>
+  );
+}
+
+function MemoryRow({ row, onDelete }: { row: OrgMemoryRow; onDelete: () => void }) {
+  return (
+    <div className="p-2 rounded border border-forge-border bg-forge-panel/40 space-y-1">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-mono text-forge-accent">#{row.id}</span>
+        <span className="text-xs text-forge-muted">
+          {new Date(row.created_at).toLocaleString()}
+        </span>
+        {row.tags.slice(0, 4).map((t) => (
+          <Badge key={t} tone="info">{t}</Badge>
+        ))}
+        <div className="flex-1" />
+        <Button variant="danger" onClick={onDelete}>Retire</Button>
+      </div>
+      <div className="text-sm font-medium">{row.key}</div>
+      <div className="text-xs text-forge-muted whitespace-pre-wrap">{row.value}</div>
     </div>
   );
 }

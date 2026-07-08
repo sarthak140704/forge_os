@@ -5,7 +5,10 @@ use forge_domain::{ForgeEvent, Goal, GoalId, GoalStatus, Mission, MissionId, Mis
 use forge_events::EventBus;
 use forge_execution::ExecutionEngine;
 use forge_llm::LlmRouter;
-use forge_persistence::{GoalRepository, MissionRepository, ReflectionRepository, TaskRepository};
+use forge_persistence::{
+    GoalRepository, MissionQueueRepository, MissionRepository, NewOrgMemory,
+    OrgMemoryRepository, ReflectionRepository, TaskRepository,
+};
 use forge_planner::{GoalSnapshot, Planner, Reflector, TaskSnapshot};
 use forge_skills::{ProposalWriter, SkillRegistry};
 use forge_tools::ToolRegistry;
@@ -66,6 +69,20 @@ pub struct MissionService {
     /// project memory. `None` disables recall. The runtime supplies an
     /// implementation backed by `MissionRepository::search_similar`.
     pub episodic_recall: Option<Arc<dyn EpisodicRecall>>,
+
+    /// Phase 4d — persisted mission execution queue. When set,
+    /// `enqueue()` is available; the worker pool in `forge-runtime`
+    /// pulls from it and calls `plan_and_run_sync`. IPC callers that
+    /// prefer fire-and-forget still use `plan_and_run` which spawns a
+    /// background task — set to `None` to disable queueing entirely.
+    #[allow(clippy::type_complexity)]
+    pub queue:      Option<Arc<dyn MissionQueueRepository>>,
+
+    /// Phase 4f — organizational memory. When set, the reflector's
+    /// insights are persisted as memory rows keyed on mission title
+    /// keywords, and future missions' planners recall matching rows.
+    #[allow(clippy::type_complexity)]
+    pub org_memory: Option<Arc<dyn OrgMemoryRepository>>,
 }
 
 /// Recall provider — the runtime binds this to a keyword search over prior
@@ -101,7 +118,50 @@ impl MissionService {
     /// Runs the executor + replan loop as a background task; returns
     /// immediately with the id.
     pub async fn plan_and_run(&self, id: MissionId) -> Result<(), MissionError> {
-        // Step 1: transition Draft → Planning.
+        let (selected_owned, ready_to_run) = self.plan_only(id).await?;
+        if !ready_to_run {
+            return Ok(());
+        }
+        // Kick off the replan loop + reflection in the background so IPC returns fast.
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.execute_and_reflect(id, selected_owned).await;
+        });
+        Ok(())
+    }
+
+    /// Blocking variant of `plan_and_run` — used by the WorkerPool
+    /// (Phase 4d) so the worker's queue row stays `Claimed` until the
+    /// mission is actually terminal. `plan_and_run` (async) returns as
+    /// soon as planning is done, which is the wrong shape for a worker.
+    pub async fn plan_and_run_sync(&self, id: MissionId) -> Result<(), MissionError> {
+        let (selected_owned, ready_to_run) = self.plan_only(id).await?;
+        if !ready_to_run {
+            return Ok(());
+        }
+        self.execute_and_reflect(id, selected_owned).await;
+        Ok(())
+    }
+
+    /// Insert a row into the persisted mission queue. Idempotent per
+    /// mission (see `MissionQueueRepository::enqueue`). Errors if no
+    /// queue is wired.
+    pub async fn enqueue(&self, id: MissionId) -> Result<i64, MissionError> {
+        let Some(q) = self.queue.as_ref() else {
+            return Err(MissionError::State("mission queue not configured".into()));
+        };
+        let row_id = q.enqueue(id).await?;
+        self.events.publish(ForgeEvent::MissionQueued { mission_id: id, queue_id: row_id }).await?;
+        Ok(row_id)
+    }
+
+    /// Steps 1-3 of the old plan_and_run: transition to Planning,
+    /// select skills, run initial plan, persist goals/tasks, transition
+    /// to Ready → Running. Returns the selected skills and a flag
+    /// indicating whether execution should proceed. When the mission
+    /// can't transition to Planning (already terminal) returns
+    /// `(vec![], false)` — the caller should short-circuit.
+    async fn plan_only(&self, id: MissionId) -> Result<(Vec<forge_skills::Skill>, bool), MissionError> {
         let mut mission = self.missions.get(id).await?;
         if !mission.status.can_transition(&MissionStatus::Planning) {
             return Err(MissionError::State(format!(
@@ -137,12 +197,23 @@ impl MissionService {
                 block_preview: preview,
             }).await;
         }
+        // Phase 4f — org memory recall (best-effort).
+        let org_mem_block: Option<String> = self.fetch_org_memory_block(&mission).await;
+        if let Some(block) = org_mem_block.as_ref() {
+            let preview: String = block.chars().take(240).collect();
+            let _ = self.events.publish(ForgeEvent::OrgMemoryRecalled {
+                mission_id: id,
+                block_preview: preview,
+            }).await;
+        }
         let recall_block = recall.as_ref().map(|r| r.block.as_str());
-        let combined_memory: Option<String> = match (self.project_memory.as_deref(), recall_block) {
-            (Some(pm), Some(rb)) => Some(format!("{rb}\n\n---\n\n{pm}")),
-            (Some(pm), None)     => Some(pm.to_string()),
-            (None,     Some(rb)) => Some(rb.to_string()),
-            (None,     None)     => None,
+        // Merge (org_memory ⨟ episodic ⨟ project) — all optional, joined with dividers.
+        let combined_memory: Option<String> = {
+            let mut parts: Vec<&str> = Vec::new();
+            if let Some(m) = org_mem_block.as_deref() { parts.push(m); }
+            if let Some(m) = recall_block            { parts.push(m); }
+            if let Some(m) = self.project_memory.as_deref() { parts.push(m); }
+            if parts.is_empty() { None } else { Some(parts.join("\n\n---\n\n")) }
         };
         let memory = combined_memory.as_deref();
         let plan = match self.planner.plan(&mission, &self.tools.schemas(), &selected, memory).await {
@@ -169,32 +240,52 @@ impl MissionService {
             self.events.publish(ForgeEvent::MissionStatusChanged { id, from, to: next }).await?;
         }
 
-        // Kick off the replan loop + reflection in the background so IPC returns fast.
-        let this = self.clone();
-        let selected_owned: Vec<forge_skills::Skill> = selected.into_iter().cloned().collect();
-        tokio::spawn(async move {
-            if let Err(e) = this.run_with_replan_loop(id, selected_owned).await {
-                tracing::error!(mission_id = %id, err = %e, "mission loop failed");
+        Ok((selected.into_iter().cloned().collect(), true))
+    }
+
+    /// Execute + replan + reflect + cost summary. Returns when the
+    /// mission reaches a terminal state. Shared between the async
+    /// `plan_and_run` (which wraps this in tokio::spawn) and
+    /// `plan_and_run_sync` (which awaits it directly).
+    async fn execute_and_reflect(&self, id: MissionId, selected_owned: Vec<forge_skills::Skill>) {
+        if let Err(e) = self.run_with_replan_loop(id, selected_owned).await {
+            tracing::error!(mission_id = %id, err = %e, "mission loop failed");
+        }
+        if let Some(router) = self.llm_router.as_ref() {
+            if let Some(cost) = router.drain_mission_cost(&id.to_string()) {
+                let _ = self.events.publish(ForgeEvent::MissionCostSummary {
+                    mission_id: id,
+                    llm_calls:  cost.calls,
+                    prompt_tokens:     cost.prompt_tokens,
+                    completion_tokens: cost.completion_tokens,
+                    total_latency_ms:  cost.total_latency_ms,
+                }).await;
             }
-            // Drain per-mission LLM cost bucket and emit summary event.
-            // Best-effort — router may be absent (tests) or bucket may be empty
-            // (mission never called an LLM successfully).
-            if let Some(router) = this.llm_router.as_ref() {
-                if let Some(cost) = router.drain_mission_cost(&id.to_string()) {
-                    let _ = this.events.publish(ForgeEvent::MissionCostSummary {
-                        mission_id: id,
-                        llm_calls:  cost.calls,
-                        prompt_tokens:     cost.prompt_tokens,
-                        completion_tokens: cost.completion_tokens,
-                        total_latency_ms:  cost.total_latency_ms,
-                    }).await;
-                }
-            }
-            if let Err(e) = this.reflect_and_learn(id).await {
-                tracing::warn!(mission_id = %id, err = %e, "reflection pass failed; continuing");
-            }
-        });
-        Ok(())
+        }
+        if let Err(e) = self.reflect_and_learn(id).await {
+            tracing::warn!(mission_id = %id, err = %e, "reflection pass failed; continuing");
+        }
+    }
+
+    /// Phase 4f — pull top-K matching memory rows for this mission's
+    /// title + description keywords and format them as a planner block.
+    /// Returns None when memory isn't wired or there are no matches.
+    async fn fetch_org_memory_block(&self, mission: &Mission) -> Option<String> {
+        let repo = self.org_memory.as_ref()?;
+        let text = format!("{} {}", mission.title, mission.description);
+        let keywords = keyword_extract(&text, 8);
+        if keywords.is_empty() {
+            return None;
+        }
+        let rows = repo.search(&keywords, 5).await.ok()?;
+        if rows.is_empty() {
+            return None;
+        }
+        let mut out = String::from("## Prior learnings\n");
+        for r in &rows {
+            out.push_str(&format!("- **{}** — {}\n", r.key, truncate(&r.value, 200)));
+        }
+        Some(out)
     }
 
     /// Run the executor; then repeatedly ask the planner to replan until it
@@ -348,6 +439,43 @@ impl MissionService {
         let payload = serde_json::to_string(&reflection).unwrap_or_else(|_| "{}".into());
         if let Err(e) = self.learning.reflections.insert(id, &outcome, &payload).await {
             tracing::warn!(mission_id = %id, err = %e, "failed to persist reflection");
+        }
+
+        // Phase 4f — persist reflection insights as durable org memory.
+        // Skipped when memory isn't wired. Zero extra LLM cost: we reuse
+        // the reflector's already-computed `insights` list. Tag with the
+        // mission's own title keywords + selected skill names so future
+        // planners can surface these rows via keyword recall.
+        let mut memory_written = 0usize;
+        if let Some(mem) = self.org_memory.as_ref() {
+            let selected_skill_names: Vec<String> = self
+                .skills.names().into_iter().collect();
+            let title_keywords = keyword_extract(&format!("{} {}", mission.title, mission.description), 6);
+            let mut tags = title_keywords;
+            for n in selected_skill_names.iter().take(3) {
+                if !tags.iter().any(|t| t == n) { tags.push(n.clone()); }
+            }
+            for insight in &reflection.insights {
+                let trimmed = insight.trim();
+                if trimmed.len() < 12 { continue; } // reject noise like "ok"
+                let key = keyify(trimmed, 60);
+                let new = NewOrgMemory {
+                    key:               key.clone(),
+                    value:             truncate(trimmed, 500).to_string(),
+                    tags:              tags.clone(),
+                    source_mission_id: Some(id),
+                };
+                match mem.insert(&new).await {
+                    Ok(row_id) => {
+                        memory_written += 1;
+                        let _ = self.events.publish(ForgeEvent::OrgMemoryLearned {
+                            mission_id: id, memory_id: row_id, key: key.clone(),
+                        }).await;
+                    }
+                    Err(e) => tracing::warn!(mission_id = %id, err = %e, "failed to persist org memory row"),
+                }
+            }
+            tracing::info!(mission_id = %id, memory_written, "org memory extraction done");
         }
 
         // Write skill proposals.
@@ -527,6 +655,78 @@ fn truncate(s: &str, cap: usize) -> String {
     let mut cut = cap;
     while cut > 0 && !s.is_char_boundary(cut) { cut -= 1; }
     format!("{}…", &s[..cut])
+}
+
+/// Extract lowercase alphanumeric tokens of length ≥3 from `text`. Sorted
+/// by first appearance, deduped, capped at `limit`. A very small stop-word
+/// list is dropped to reduce false-positive keyword matches in org memory
+/// search — kept intentionally short so we don't lose useful terms like
+/// "test", "file", "http" that are keywords in a lot of missions.
+pub(crate) fn keyword_extract(text: &str, limit: usize) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the","and","for","that","this","with","from","into","have","are","was",
+        "will","use","using","how","what","when","where","which","should",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for raw in text.split(|c: char| !c.is_alphanumeric()) {
+        if raw.len() < 3 { continue; }
+        let lower = raw.to_lowercase();
+        if STOP.contains(&lower.as_str()) { continue; }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+            if out.len() >= limit { break; }
+        }
+    }
+    out
+}
+
+/// Turn a free-text insight into a snake_case memory key ≤ `max_len` chars.
+/// Deterministic, so re-extracting the same insight collides (harmless — the
+/// value column still stores the full text and older rows remain).
+pub(crate) fn keyify(text: &str, max_len: usize) -> String {
+    let mut s = String::with_capacity(max_len);
+    let mut last_was_underscore = true;
+    for c in text.chars() {
+        if s.len() >= max_len { break; }
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() { s.push(lc); }
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            s.push('_');
+            last_was_underscore = true;
+        }
+    }
+    let out = s.trim_matches('_').to_string();
+    if out.is_empty() { "memory".to_string() } else { out }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn keyword_extract_drops_short_and_stopwords() {
+        let kws = keyword_extract("Use Python to run the pytest suite", 10);
+        assert!(kws.contains(&"python".to_string()));
+        assert!(kws.contains(&"pytest".to_string()));
+        assert!(kws.contains(&"suite".to_string()));
+        assert!(!kws.contains(&"the".to_string()), "should drop 'the'");
+        assert!(!kws.contains(&"to".to_string()),  "should drop <3 char");
+    }
+
+    #[test]
+    fn keyword_extract_dedups_preserving_order() {
+        let kws = keyword_extract("Python python Python testing", 10);
+        assert_eq!(kws, vec!["python".to_string(), "testing".to_string()]);
+    }
+
+    #[test]
+    fn keyify_produces_snake_case() {
+        assert_eq!(keyify("Prefer `pytest -q` in the project root!", 40), "prefer_pytest_q_in_the_project_root");
+        assert_eq!(keyify("::::   ::::", 20), "memory");
+        assert!(keyify(&"x".repeat(200), 20).len() <= 20);
+    }
 }
 
 #[derive(Debug, serde::Serialize)]

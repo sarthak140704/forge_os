@@ -723,6 +723,149 @@ cargo run -p forge-runtime --example skill_validation_smoke
 
 ---
 
+## TC-P4D-01 · Mission queue enqueue emits MissionQueued
+
+**Prompt** — open Settings > Mission Queue. Confirm the workers badge shows either "N workers" (green) or "inline mode" (blue).
+
+**Backend proof**
+```powershell
+cargo run -p forge-runtime --example worker_pool_smoke
+# expect: PASS: worker pool + queue verified end-to-end
+# The first scenario prints "✓ saw 4 MissionQueued events"
+```
+
+## TC-P4D-02 · Worker pool claims and finishes in parallel
+
+**Backend proof**
+```powershell
+cargo run -p forge-runtime --example worker_pool_smoke
+# expect scenario 1 to print "✓ queue drained: queued=0, claimed=0"
+# within 10s (2 workers × 4 missions)
+```
+Also inspect a live DB after enqueueing via the smoke:
+```powershell
+python scripts\forge-inspect.py query "SELECT status, COUNT(*) FROM mission_queue GROUP BY status"
+```
+
+## TC-P4D-03 · Crash recovery requeues stale claims
+
+**Backend proof**
+Scenario 3 of the smoke manually backdates `heartbeat_at` on a Claimed row, then calls `requeue_stale(6)`, verifying it moves the row back to Queued.
+```powershell
+cargo run -p forge-runtime --example worker_pool_smoke
+# expect: "✓ requeue_stale rescued 1 row(s)"
+```
+
+## TC-P4D-04 · Terminal missions can be re-enqueued
+
+By design, `enqueue` is idempotent only against ACTIVE (Queued|Claimed) rows; a mission in a terminal state (Done|Failed) can be re-enqueued as a fresh retry row. Scenario 2 of the smoke asserts this behavior:
+```powershell
+cargo run -p forge-runtime --example worker_pool_smoke
+# expect: "✓ retry row appended: 4 → 5"
+```
+
+## TC-P4D-05 · Runnable · queue + memory persistence unit tests
+
+```powershell
+cargo test -p forge-persistence
+# expect: 6 passed; 0 failed
+# covers: SqliteMissionQueueRepository (idempotency, claim/finish, stale requeue)
+#         SqliteOrgMemoryRepository (insert/search/retire)
+#         postgres::connect NotYetImplemented shape
+```
+
+---
+
+## TC-P4E-01 · PersistenceHandles URL dispatch
+
+```powershell
+cargo run -p forge-runtime --example postgres_dispatch_smoke
+# expect: PASS: PersistenceHandles URL dispatch verified
+# Confirms:
+#   sqlite://…?mode=rwc      → real SQLite bundle
+#   postgres://forge@…       → NotYetImplemented("postgres persistence backend")
+#   mysql://nope             → rejected downstream
+```
+
+## TC-P4E-02 · Postgres stub message points to the roadmap
+
+The `NotYetImplemented` payload must reference `crates/forge-persistence/src/postgres.rs`:
+```powershell
+cargo run -p forge-runtime --example postgres_dispatch_smoke 2>&1 | Select-String "postgres.rs"
+# expect a line ending with "…see crates/forge-persistence/src/postgres.rs head comment for the Phase 5 rollout plan"
+```
+
+---
+
+## TC-P4F-01 · Org memory extractor persists reflection insights
+
+**Setup** — run any completed mission (Groq or Ollama) whose reflection produces insights.
+
+**Backend proof**
+```powershell
+python scripts\forge-inspect.py query "SELECT id, key, tags, source_mission_id FROM org_memory ORDER BY id DESC LIMIT 5"
+# expect one row per insight from the most recent reflection
+```
+
+Also check the event stream:
+```powershell
+python scripts\forge-inspect.py events-type org_memory_learned -n 10
+```
+
+## TC-P4F-02 · Planner recalls org memory on the next mission
+
+**Setup** — after TC-P4F-01, run a second mission whose title shares keywords with a memory row's tags.
+
+**UI proof** — EventTimeline for the second mission shows an `org_memory_recalled` line with a preview of the injected block.
+
+**Backend proof**
+```powershell
+python scripts\forge-inspect.py events-type org_memory_recalled -n 5
+# for the newer mission, expect block_preview to include text from the memory's `value`
+```
+
+## TC-P4F-03 · UI retire hides a memory row
+
+**Prompt** — open Settings > Organizational Memory. Click Retire on one row. Confirm the row disappears.
+
+**Backend proof**
+```powershell
+python scripts\forge-inspect.py query "SELECT id, retired_at FROM org_memory WHERE retired_at IS NOT NULL ORDER BY id DESC LIMIT 5"
+# retired row appears with retired_at timestamp
+```
+
+## TC-P4F-04 · Retire is idempotent
+
+Click Retire on a memory row, then via `sqlite3` inspect that a second retire call would be a no-op:
+```powershell
+python scripts\forge-inspect.py query "SELECT retire_id, COUNT(*) FROM org_memory WHERE id = <ID> AND retired_at IS NOT NULL"
+```
+Or run the smoke:
+```powershell
+cargo run -p forge-runtime --example org_memory_smoke
+# expect scenario 4: first retire returns true, second returns false
+```
+
+## TC-P4F-05 · Runnable · org memory storage smoke
+
+```powershell
+cargo run -p forge-runtime --example org_memory_smoke
+# expect: PASS: org memory storage verified end-to-end
+# 4 scenarios: insert × 3, list_active ordering, search by tag, idempotent retire
+```
+
+---
+
+## TC-BUG-01 · Mission-filter after create shows the new mission's events
+
+**Regression check for the `msn_<uuid>` vs raw-UUID mismatch.**
+
+**Prompt** — create a mission via the New Mission form. Confirm the EventTimeline for the newly-selected mission is NOT empty (should show `mission_created`, `mission_planning_started`, then goal/task events as they arrive).
+
+Prior to the fix, `create_mission` returned `msn_<uuid>` (Display form) while events serialize as raw UUID, so `filterEvents` with `missionId === selected` never matched and the timeline stayed empty for freshly-created missions.
+
+---
+
 # Cross-cutting
 
 ## TC-X-01 · LLM router failover + circuit breaker
@@ -950,14 +1093,20 @@ Run in this order. Any FAIL → don't ship.
 | 2 | TC-P4A-06 (skill versioning smoke) | Runnable | 30 s |
 | 3 | TC-P4B-05 (validation gate smoke) | Runnable | 30 s |
 | 4 | TC-P4C-04 (curator smoke) | Runnable | 30 s |
-| 5 | TC-X-05 (checkpoints smoke) | Runnable | 30 s |
-| 6 | TC-X-03 (materialize smoke) — needs GROQ_API_KEY | Runnable | 30 s |
-| 7 | TC-X-02 (MCP round-trip) | Runnable | 30 s |
-| 8 | TC-P1-01 (mission happy path) — verify with `python scripts/forge-inspect.py mission $MID` | UI+backend | 2 min |
-| 9 | TC-P1-02 (cancel) — verify events | UI+backend | 1 min |
-| 10 | TC-P4B-01 + TC-P4B-02 (bad + good proposal) | UI+backend | 2 min |
-| 11 | TC-P4C-01 (curator auto-archives duplicate) | UI+backend | 1 min |
-| 12 | TC-P3-03 (checkpoint file gone after revert) | UI+backend | 1 min |
+| 5 | TC-P4D-05 (queue + memory unit tests) | Runnable | 20 s |
+| 6 | TC-P4D-02/03/04 (worker pool smoke) | Runnable | 30 s |
+| 7 | TC-P4E-01 (postgres dispatch smoke) | Runnable | 10 s |
+| 8 | TC-P4F-05 (org memory storage smoke) | Runnable | 15 s |
+| 9 | TC-X-05 (checkpoints smoke) | Runnable | 30 s |
+| 10 | TC-X-03 (materialize smoke) — needs GROQ_API_KEY | Runnable | 30 s |
+| 11 | TC-X-02 (MCP round-trip) | Runnable | 30 s |
+| 12 | TC-P1-01 (mission happy path) — verify with `python scripts/forge-inspect.py mission $MID` | UI+backend | 2 min |
+| 13 | TC-BUG-01 (mission-filter shows events after create) | UI+backend | 30 s |
+| 14 | TC-P1-02 (cancel) — verify events | UI+backend | 1 min |
+| 15 | TC-P4B-01 + TC-P4B-02 (bad + good proposal) | UI+backend | 2 min |
+| 16 | TC-P4C-01 (curator auto-archives duplicate) | UI+backend | 1 min |
+| 17 | TC-P3-03 (checkpoint file gone after revert) | UI+backend | 1 min |
+| 18 | TC-P4F-01/02 (memory learned then recalled on next mission) | UI+backend | 3 min |
 
 If all 10 pass, the system is verifiably working end-to-end: UI, IPC, event bus, persistence, LLM router, planner, executor, tools, policy, skills (load/select/validate/promote/rollback/retire/autopromote), reflection, cost tracking, checkpoints, MCP, materializer.
 

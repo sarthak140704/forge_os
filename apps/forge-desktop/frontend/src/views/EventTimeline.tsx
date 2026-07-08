@@ -54,6 +54,9 @@ function summarize(e: ForgeEvent): string {
     case "skill_auto_promoted": return `Skill AUTO-promoted: ${e.name} v${e.version} (${e.sha.slice(0, 8)})`;
     case "skill_auto_archived": return `Curator AUTO-archived: ${e.archived_name} (kept ${e.kept_name}, sim=${e.similarity.toFixed(3)}, rule=${e.rule})`;
     case "skill_merge_proposed": return `Curator merge proposal: ${e.merged_name} = ${e.source_a} + ${e.source_b} (sim=${e.body_similarity.toFixed(3)})`;
+    case "mission_queued": return `Mission enqueued (queue_id=${e.queue_id})`;
+    case "org_memory_recalled": return `Org memory recalled: ${e.block_preview.slice(0, 140)}${e.block_preview.length > 140 ? "…" : ""}`;
+    case "org_memory_learned": return `Org memory learned (#${e.memory_id}): ${e.key}`;
     default: return JSON.stringify(e);
   }
 }

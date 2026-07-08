@@ -34,12 +34,12 @@ events into a live React Flow DAG viewer.
 - **Audit export**: SOC 2-style report generation from event store. ✓ landed (JSON bundle of missions/goals/tasks/events/reflections via `export_audit` IPC + file picker)
 
 ## Phase 4 — Learning & Scale
-- **Learning Engine**: evaluate → reflect → extract → version → validate → promote pipeline.
-- **Skill versioning**: content-addressed skills, monotonic version numbers, rollback.
-- **Distributed execution**: multi-worker pool, Postgres-backed queue, leader election.
-- **PostgreSQL backend**: swap SQLite via repository trait, no domain changes.
-- **Organizational Memory**: Honcho integration or equivalent dialectic memory.
-- **Curator**: automated skill deprecation, dedupe, merge.
+- **Learning Engine**: evaluate → reflect → extract → version → validate → promote pipeline. ✓ landed (reflect_and_learn + AutoPromoter + Curator across 4a-4c)
+- **Skill versioning**: content-addressed skills, monotonic version numbers, rollback. ✓ landed (Phase 4a)
+- **Distributed execution**: multi-worker pool, Postgres-backed queue, leader election. ✓ landed as *in-process* worker pool + persisted SQLite queue with crash recovery (Phase 4d). Networked/leader-election is Phase 5.
+- **PostgreSQL backend**: swap SQLite via repository trait, no domain changes. ✓ landed *swap boundary* (`PersistenceHandles::open(url)` with honest `NotYetImplemented` stub; real PG impl is Phase 5) (Phase 4e)
+- **Organizational Memory**: Honcho integration or equivalent dialectic memory. ✓ landed (Phase 4f — reflection insights promoted to durable memory rows, LIKE-recall injected as a third planner memory block; embeddings/semantic recall is Phase 5)
+- **Curator**: automated skill deprecation, dedupe, merge. ✓ landed (Phase 4c)
 
 ## Phase 5 — Ecosystem
 - **Marketplace**: signed skill & plugin bundles.

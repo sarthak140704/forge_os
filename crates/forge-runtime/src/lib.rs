@@ -18,8 +18,10 @@ use forge_llm::{
 use forge_mcp::{McpConfig, McpRegistry, McpServerStatus};
 use forge_mission::{LearningDeps, MissionService};
 use forge_persistence::{
-    connect, SqliteEventStore, SqliteGoalRepository, SqliteMissionRepository, SqlitePool,
-    SqliteReflectionRepository, SqliteTaskRepository, TaskRepository, GoalRepository,
+    connect, MissionQueueRepository, OrgMemoryRepository,
+    SqliteEventStore, SqliteGoalRepository, SqliteMissionQueueRepository, SqliteMissionRepository,
+    SqliteOrgMemoryRepository, SqlitePool, SqliteReflectionRepository, SqliteTaskRepository,
+    TaskRepository, GoalRepository,
 };
 use forge_planner::{Planner, Reflector};
 use forge_policy::PolicyEngine;
@@ -39,10 +41,12 @@ pub mod checkpoints;
 pub mod secrets;
 pub mod audit;
 pub mod skills_ops;
+pub mod worker_pool;
 pub use memory::ProjectMemory;
 pub use user_memory::UserMemory;
 pub use feature_flags::FeatureFlags;
 pub use checkpoints::{Checkpoint, CheckpointStore};
+pub use worker_pool::WorkerPool;
 
 /// Bridges the executor's `TaskInputMaterializer` trait to `forge_planner`.
 /// Kept in the runtime layer (not the planner crate) so `forge-planner`
@@ -202,10 +206,31 @@ pub struct RuntimeConfig {
     /// and archives should be rare so the loop can be gentle.
     #[serde(default = "default_curator_interval_secs")]
     pub curator_interval_secs: u64,
+
+    /// Phase 4d — persisted mission-execution queue + worker pool.
+    /// Set > 0 to route `plan_and_run` through the queue instead of
+    /// spawning a fire-and-forget tokio task. Enables crash recovery
+    /// (on boot, orphaned queue rows are requeued) and per-mission
+    /// concurrency backpressure. Defaults to 0 (queue disabled — old
+    /// spawn behavior).
+    #[serde(default)]
+    pub workers: usize,
+    /// Seconds without a heartbeat after which a `Claimed` queue row
+    /// is considered orphaned and requeued. Defaults to 120 seconds.
+    #[serde(default = "default_worker_stale_secs")]
+    pub worker_stale_secs: u64,
+
+    /// Phase 4f — organizational memory. When enabled, reflection
+    /// insights are persisted as durable rows and injected into future
+    /// planner prompts via keyword recall. Off by default so tests and
+    /// bare-bones deployments stay minimal.
+    #[serde(default)]
+    pub org_memory_enabled: bool,
 }
 fn default_max_parallel() -> usize { 4 }
 fn default_autopromote_interval_secs() -> u64 { 300 }
 fn default_curator_interval_secs() -> u64 { 900 }
+fn default_worker_stale_secs() -> u64 { 120 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LlmConfig {
@@ -263,6 +288,20 @@ pub struct Runtime {
     /// Phase 4a — curator that inspects the active set for duplicates and
     /// unused entries. Emits advisory `SkillCurationSuggested` events.
     pub curator:   Option<Arc<skills_ops::Curator>>,
+
+    /// Phase 4d — persisted mission queue. Always populated (the SQLite
+    /// repo has zero cost when unused). The `WorkerPool` below is what
+    /// actually drives dequeue; if the pool isn't spawned,
+    /// `MissionService.queue` is None so `plan_and_run` stays inline.
+    pub queue:     Arc<dyn MissionQueueRepository>,
+
+    /// Phase 4d — the running worker pool, or None if `workers == 0`.
+    pub worker_pool: Option<Arc<WorkerPool>>,
+
+    /// Phase 4f — org memory repo. Same shape as `queue`: always
+    /// populated, but only wired into MissionService when
+    /// `org_memory_enabled = true`.
+    pub org_memory: Arc<dyn OrgMemoryRepository>,
 }
 
 impl Runtime {
@@ -460,6 +499,12 @@ impl Runtime {
         }
 
         let reflections_repo = Arc::new(SqliteReflectionRepository::new(pool.clone()));
+        // Phase 4d/4f — always build the repos; only optionally wire them
+        // into MissionService or spawn the pool below. Zero cost when off.
+        let queue_repo: Arc<dyn MissionQueueRepository> =
+            Arc::new(SqliteMissionQueueRepository::new(pool.clone()));
+        let org_memory_repo: Arc<dyn OrgMemoryRepository> =
+            Arc::new(SqliteOrgMemoryRepository::new(pool.clone()));
 
         // Episodic recall wire-up.
         let episodic_recall: Option<Arc<dyn forge_mission::EpisodicRecall>> =
@@ -501,6 +546,8 @@ impl Runtime {
             project_memory,
             llm_router: if flags.cost_summary.enabled { Some(llm.clone()) } else { None },
             episodic_recall,
+            queue:      if config.workers > 0 { Some(queue_repo.clone()) } else { None },
+            org_memory: if config.org_memory_enabled { Some(org_memory_repo.clone()) } else { None },
         };
 
         tracing::info!("forge runtime booted");
@@ -645,9 +692,33 @@ impl Runtime {
             (None, None)
         };
 
+        // Phase 4d — WorkerPool. Runs iff `workers > 0`. On boot, first
+        // requeues any orphaned rows (crash recovery) so a killed session
+        // resumes cleanly. Then N workers loop over claim → run → finish.
+        let worker_pool = if config.workers > 0 {
+            let requeued = queue_repo.requeue_stale(config.worker_stale_secs as i64).await
+                .unwrap_or(0);
+            if requeued > 0 {
+                tracing::info!(count = requeued, "requeued orphaned mission-queue rows at boot");
+            }
+            let pool = Arc::new(WorkerPool::new(
+                queue_repo.clone(),
+                missions.clone(),
+                events.clone(),
+                config.workers,
+                config.worker_stale_secs,
+            ));
+            pool.clone().spawn();
+            tracing::info!(workers = config.workers, "worker pool started");
+            Some(pool)
+        } else {
+            None
+        };
+
         Ok(Self {
             config, pool, events, missions, tools, llm, mcp, checkpoints,
             goals: goals_repo, tasks: tasks_repo, skill_ops, curator,
+            queue: queue_repo, worker_pool, org_memory: org_memory_repo,
         })
     }
 }

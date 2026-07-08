@@ -107,7 +107,10 @@ export type ForgeEvent =
   | { type: "skill_validation_failed"; filename: string; name: string; failed_checks: string[] }
   | { type: "skill_auto_promoted"; name: string; sha: string; version: string }
   | { type: "skill_auto_archived"; archived_name: string; archived_sha: string; kept_name: string; similarity: number; rule: string }
-  | { type: "skill_merge_proposed"; proposal_filename: string; merged_name: string; source_a: string; source_b: string; body_similarity: number };
+  | { type: "skill_merge_proposed"; proposal_filename: string; merged_name: string; source_a: string; source_b: string; body_similarity: number }
+  | { type: "mission_queued"; mission_id: string; queue_id: number }
+  | { type: "org_memory_recalled"; mission_id: string; block_preview: string }
+  | { type: "org_memory_learned"; mission_id: string; memory_id: number; key: string };
 
 export interface EventEnvelope {
   seq: number;

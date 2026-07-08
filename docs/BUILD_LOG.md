@@ -378,7 +378,228 @@ The smoke covers dry-run classification, apply (dedupe + merge + validator OK), 
 ---
 
 
-## Frontend surface
+## Phase 4d — Distributed / Worker Pool (SHIPPED)
+
+**Motivation (agent.txt):** *"Missions must survive restarts and run concurrently."* Phase 4d puts a persisted queue in front of the executor so the UI can enqueue N missions and workers drain them in parallel — with crash recovery, backpressure visibility, and honest scope (in-process workers, not networked; that's Phase 5).
+
+### Schema — migration V003 (`crates/forge-persistence/src/migrations.rs`)
+
+```sql
+CREATE TABLE mission_queue (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_id   TEXT    NOT NULL,
+  status       TEXT    NOT NULL,        -- queued|claimed|done|failed
+  claimed_by   TEXT,
+  claimed_at   TEXT,
+  heartbeat_at TEXT,
+  finished_at  TEXT,
+  error        TEXT,
+  enqueued_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_queue_status ON mission_queue(status);
+CREATE INDEX idx_queue_mission ON mission_queue(mission_id);
+```
+
+Multiple rows per `mission_id` are allowed (retries after terminal state); at most one Queued/Claimed row per mission is enforced at the `enqueue` call site.
+
+### Queue trait — `crates/forge-persistence/src/lib.rs`
+
+`MissionQueueRepository`:
+- `enqueue(mid)` — idempotent on ACTIVE dupes; terminal rows can be re-enqueued as fresh retry rows.
+- `claim_next(worker_id)` — two-step SELECT-then-UPDATE transaction. Returns `None` on lost race → worker loops.
+- `heartbeat(id)` — no-op if the row moved (worker got kicked off).
+- `finish(id, success, error)` — terminal transition.
+- `requeue_stale(secs)` — rescue any Claimed row whose heartbeat is older than `secs` (or was never heartbeated and claimed more than `secs` ago).
+- `depth() -> (queued, claimed)`, `recent(n)` — observability.
+
+`SqliteMissionQueueRepository` at the bottom of `sqlite.rs` with 4 unit tests (enqueue idempotency, claim/finish, stale requeue, depth/recent).
+
+### WorkerPool — `crates/forge-runtime/src/worker_pool.rs` (NEW)
+
+- N tokio worker tasks (`workers: N` in `RuntimeConfig`, default 0 = disabled). Each loops:
+  `claim_next → spawn heartbeat task → plan_and_run_sync → abort heartbeat → finish(success)`.
+- Janitor task runs `requeue_stale(stale_after_secs)` every `stale_after_secs / 2`.
+- Per-mission heartbeat task fires every `stale_after_secs / 3`.
+- Head comment documents "why not just tokio::spawn" (needs persistence + observability) and "why not networked distributed" (personal-desktop scope; Phase 5).
+
+### MissionService integration (`crates/forge-mission/src/lib.rs`)
+
+- New public methods:
+  - `enqueue(id)` — inserts into queue, publishes `MissionQueued`. Called by the IPC layer (currently only via the smoke; no UI enqueue button yet — planned Phase 5).
+  - `plan_and_run_sync(id)` — plan + execute-and-reflect inline (blocking). WorkerPool calls this.
+- Existing `plan_and_run(id)` — kept as a `tokio::spawn` wrapper for backward compat. IPC still uses it so `plan_and_run` returns immediately.
+- Two shared helpers (`plan_only`, `execute_and_reflect`) factor the sync/async paths cleanly.
+- When `workers == 0` (default), MissionService's `queue: None` and everything behaves exactly like Phase 3.
+
+### Boot flow (`crates/forge-runtime/src/lib.rs`)
+
+1. Build queue + org_memory repos (always) and expose on `Runtime`.
+2. If `workers > 0`:
+   - Wire queue into MissionService.
+   - Run `queue.requeue_stale(worker_stale_secs)` once at boot (crash recovery).
+   - Spawn `WorkerPool::new(...).start()`.
+
+### Events (`crates/forge-domain/src/event.rs`)
+
+- `MissionQueued { mission_id, queue_id }` — fired by `MissionService::enqueue`.
+
+### IPC + UI
+
+- New command `queue_status()` → `{workers, queued, claimed, recent: [MissionQueueRow]}`.
+- `Settings > Mission Queue` section:
+  - Badge: `N workers` (green) or `inline mode` (blue).
+  - Live `queued` + `claimed` counts (auto-refresh every 4s).
+  - Recent 20 rows, colour-coded by status: `done`=green, `failed`=red, `claimed`=amber, `queued`=blue.
+- Frontend event union + `event-filter.ts` + `EventTimeline.tsx` updated for `mission_queued`.
+
+### Verify
+
+```powershell
+cargo test -p forge-persistence                            # 6/6 pass (2 queue + 2 memory + 2 postgres stub)
+cargo run -p forge-runtime --example worker_pool_smoke     # 3/3 scenarios pass
+```
+
+The smoke enqueues 4 missions with `workers=2`, drains them, then simulates a crashed worker (backdate heartbeat) and verifies `requeue_stale` rescues it within one janitor tick.
+
+
+## Phase 4e — Postgres Backend Scaffold (SHIPPED — trait boundary only)
+
+**Motivation:** cleanly separate SQLite specifics from the mission domain so a future Postgres backend is a build-time swap, not a refactor.
+
+### `PersistenceHandles` — `crates/forge-persistence/src/lib.rs`
+
+```rust
+pub struct PersistenceHandles {
+    pub pool_kind: PoolKind,   // Sqlite | Postgres
+    pub events:      Arc<dyn EventStore>,
+    pub missions:    Arc<dyn MissionRepository>,
+    pub goals:       Arc<dyn GoalRepository>,
+    pub tasks:       Arc<dyn TaskRepository>,
+    pub reflections: Arc<dyn ReflectionRepository>,
+    pub skills:      Arc<dyn SkillHistoryRepository>,
+    pub queue:       Arc<dyn MissionQueueRepository>,
+    pub memory:      Arc<dyn OrgMemoryRepository>,
+    pub sqlite_pool: Option<SqlitePool>,  // for shadow-git / raw SQL only
+}
+```
+
+- `PersistenceHandles::sqlite(url)` — normal boot path.
+- `PersistenceHandles::postgres(url)` — currently returns `PersistenceError::NotYetImplemented("postgres persistence backend")`.
+- `PersistenceHandles::open(url)` — dispatches by URL scheme: `postgres://` or `postgresql://` → `postgres()`, everything else → `sqlite()`.
+
+### Honest stub — `crates/forge-persistence/src/postgres.rs` (NEW)
+
+Validates the URL shape and returns `NotYetImplemented`. Head comment contains the concrete 5-step Phase 5 rollout plan (add `sqlx-postgres`, translate migrations, port each Sqlite repo, wire on `open()`, add integration test with docker-compose).
+
+### `PersistenceError::NotYetImplemented(&'static str)`
+
+New variant, used by the postgres stub and reserved for future capability-gated features.
+
+### Runtime wiring
+
+The Runtime doesn't yet route through `PersistenceHandles::open` — it still constructs SQLite repos directly. The `PersistenceHandles` bundle is a public swap boundary for external callers and future refactors. This keeps the Phase 4e diff scoped.
+
+### Verify
+
+```powershell
+cargo run -p forge-runtime --example postgres_dispatch_smoke   # 3/3 scenarios pass
+```
+
+Confirms `sqlite://` opens successfully with a working queue repo, `postgres://` returns the honest error, and unknown schemes are rejected downstream by the SQLite validator.
+
+
+## Phase 4f — Organizational Memory (SHIPPED)
+
+**Motivation (agent.txt):** *"The system should get smarter across missions, not just within one."* Phase 4f captures durable cross-mission insights and injects them into every planner prompt as a third memory layer alongside episodic (per-mission history) and project (workspace facts).
+
+### Schema — migration V004
+
+```sql
+CREATE TABLE org_memory (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  key               TEXT    NOT NULL,     -- one-line insight headline
+  value             TEXT    NOT NULL,     -- full insight body
+  tags              TEXT    NOT NULL,     -- JSON array of lowercased tokens
+  source_mission_id TEXT,                 -- which mission produced it
+  created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+  retired_at        TEXT                  -- soft-delete via UI
+);
+CREATE INDEX idx_orgmem_active ON org_memory(retired_at) WHERE retired_at IS NULL;
+```
+
+### Trait — `crates/forge-persistence/src/lib.rs`
+
+`OrgMemoryRepository`:
+- `insert(&NewOrgMemory) -> id`
+- `retire(id) -> bool` (idempotent; second call returns false).
+- `list_active(limit) -> Vec<OrgMemoryRow>` (newest first).
+- `search(keywords: &[String], limit) -> Vec<OrgMemoryRow>` — case-insensitive LIKE across key/value/tags, scored by match count. MVP; a real semantic recall (sqlite-vss) is Phase 5.
+
+### Extractor — `crates/forge-mission/src/lib.rs`
+
+**Zero extra LLM cost.** `reflect_and_learn` already produces `reflection.insights: Vec<String>` per mission. Phase 4f persists each entry as an `org_memory` row with:
+- `key` = insight text (first ~120 chars).
+- `value` = insight text (full).
+- `tags` = mission title keywords (`keyword_extract`) + top-3 selected skill names.
+- `source_mission_id` = the reflecting mission.
+
+Each write publishes `OrgMemoryLearned { mission_id, memory_id, key }`.
+
+### Planner hook
+
+Private `fetch_org_memory_block(mission_id, title)` runs before planning:
+1. Tokenize title into keywords via `keyword_extract`.
+2. `search(keywords, 5)` — top-5 relevant memories.
+3. Format as a markdown block; publish `OrgMemoryRecalled { mission_id, block_preview }`.
+
+Memory blocks are chained in the planner prompt in this order:
+```
+<org_memory>   ← most durable, cross-mission
+<episodic>     ← past attempts of similar missions
+<project>      ← workspace-specific facts
+```
+
+Joined with `\n\n---\n\n`. Only sections with content are included.
+
+### Helpers (`crates/forge-mission/src/lib.rs`)
+
+- `keyword_extract(&str) -> Vec<String>` — lowercase, split on non-alphanumeric, drop tokens with `len < 3`, dedup. 3 unit tests.
+- `keyify(&str) -> String` — normalized single-line form.
+
+### Events (`crates/forge-domain/src/event.rs`)
+
+- `OrgMemoryLearned { mission_id, memory_id, key }`
+- `OrgMemoryRecalled { mission_id, block_preview }`
+
+Both fire under `AggregateKind::Mission`.
+
+### IPC + UI
+
+- Commands: `list_org_memory(limit=200)`, `delete_org_memory(id)`.
+- `Settings > Organizational Memory` section:
+  - Rows show `#id`, timestamp, tag badges (max 4), key (bold), full value.
+  - "Retire" button on each row (confirm dialog; soft-delete).
+- Frontend event union + summaries updated for both new events.
+
+### Verify
+
+```powershell
+cargo run -p forge-runtime --example org_memory_smoke     # 4/4 scenarios pass
+```
+
+Covers insert × 3, list_active ordering, search by tag (rust=2, python=1), and idempotent retire.
+
+
+## Bug fix — Mission-filter ID mismatch
+
+`MissionId`'s `Display` renders `msn_<uuid>` but `#[serde(transparent)]` serializes it as a raw UUID. Prior `create_mission` returned `id.to_string()` (prefixed), while every event payload + `list_missions` row uses the raw UUID form via serde. Result: the UI auto-selected the newly-created mission with the prefixed form but every event filtered on it never matched → the mission's DAG loaded but its event timeline stayed empty.
+
+Fixed in `apps/forge-desktop/src-tauri/src/lib.rs` — `create_mission` now returns `id.as_uuid().to_string()` with a comment explaining the trap.
+
+---
+
+
+
 
 **Stores** (`apps/forge-desktop/frontend/src/stores/`)
 - `useUiStore` — `selectedMissionId`, `select(id)`

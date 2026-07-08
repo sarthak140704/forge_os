@@ -57,6 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         curator: Default::default(),
         curator_sweep_enabled: false,
         curator_interval_secs: 900,
+        workers: 0,
+        worker_stale_secs: 120,
+        org_memory_enabled: false,
     };
     let runtime = Runtime::boot(config).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;

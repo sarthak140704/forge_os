@@ -84,3 +84,46 @@ CREATE INDEX IF NOT EXISTS idx_skills_history_name       ON skills_history(name,
 CREATE INDEX IF NOT EXISTS idx_skills_history_sha        ON skills_history(sha);
 CREATE INDEX IF NOT EXISTS idx_skills_history_promoted   ON skills_history(promoted_at);
 "#;
+
+/// Phase 4d — Persisted mission execution queue.
+///
+/// One row per plan_and_run invocation. Workers `claim` a queued row
+/// atomically, `heartbeat` while running, and `finish` (or `fail`) on
+/// completion. On boot, orphaned rows (status=claimed with stale
+/// heartbeat) are requeued so a crash can't lose a mission.
+pub const V003_MISSION_QUEUE: &str = r#"
+CREATE TABLE IF NOT EXISTS mission_queue (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id    TEXT    NOT NULL,
+    status        TEXT    NOT NULL,         -- queued | claimed | done | failed
+    claimed_by    TEXT,
+    claimed_at    TEXT,
+    heartbeat_at  TEXT,
+    finished_at   TEXT,
+    error         TEXT,
+    enqueued_at   TEXT    NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_mission_queue_status   ON mission_queue(status, enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_mission_queue_mission  ON mission_queue(mission_id);
+"#;
+
+/// Phase 4f — Organizational memory.
+///
+/// Durable, cross-mission facts extracted from reflections and surfaced
+/// back into the planner prompt on future missions. MVP uses LIKE-search
+/// on `tags`; embedding-based recall is Phase 5. Each row is append-only;
+/// `retired_at` is the only mutable column (soft-delete for UI).
+pub const V004_ORG_MEMORY: &str = r#"
+CREATE TABLE IF NOT EXISTS org_memory (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    key               TEXT    NOT NULL,
+    value             TEXT    NOT NULL,
+    tags              TEXT    NOT NULL DEFAULT '[]',
+    source_mission_id TEXT,
+    created_at        TEXT    NOT NULL,
+    retired_at        TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_org_memory_key      ON org_memory(key);
+CREATE INDEX IF NOT EXISTS idx_org_memory_active   ON org_memory(retired_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_org_memory_source   ON org_memory(source_mission_id);
+"#;

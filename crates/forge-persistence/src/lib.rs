@@ -20,6 +20,10 @@ pub enum PersistenceError {
     Json(#[from] serde_json::Error),
     #[error("not found: {kind} {id}")]
     NotFound { kind: &'static str, id: String },
+    /// Emitted by the Postgres scaffold module (Phase 4e). The trait
+    /// boundary is proven but the concrete impl is future work.
+    #[error("not yet implemented: {0}")]
+    NotYetImplemented(&'static str),
 }
 
 #[async_trait]
@@ -186,7 +190,202 @@ pub trait SkillHistoryRepository: Send + Sync {
     async fn list_active(&self) -> Result<Vec<SkillVersionRecord>, PersistenceError>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4d — Persisted mission-execution queue.
+// ---------------------------------------------------------------------------
+
+/// A row in the mission execution queue. Multiple queue rows per mission_id
+/// are allowed (e.g. after crash recovery), but at any time only ONE row per
+/// mission_id should be in `Queued` or `Claimed` state — enforced by
+/// `enqueue`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueStatus { Queued, Claimed, Done, Failed }
+
+impl QueueStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueueStatus::Queued  => "queued",
+            QueueStatus::Claimed => "claimed",
+            QueueStatus::Done    => "done",
+            QueueStatus::Failed  => "failed",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "claimed" => QueueStatus::Claimed,
+            "done"    => QueueStatus::Done,
+            "failed"  => QueueStatus::Failed,
+            _         => QueueStatus::Queued,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MissionQueueRow {
+    pub id:           i64,
+    pub mission_id:   String,
+    pub status:       QueueStatus,
+    pub claimed_by:   Option<String>,
+    pub claimed_at:   Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub finished_at:  Option<String>,
+    pub error:        Option<String>,
+    pub enqueued_at:  String,
+}
+
+#[async_trait]
+pub trait MissionQueueRepository: Send + Sync {
+    /// Insert a `Queued` row for `mission_id` iff no active
+    /// (Queued|Claimed) row already exists for that mission. Returns the
+    /// new (or existing) row's id. Idempotent on active dupes.
+    async fn enqueue(&self, mission_id: MissionId) -> Result<i64, PersistenceError>;
+
+    /// Atomically claim the oldest queued row for a worker. Returns None
+    /// when the queue is empty.
+    async fn claim_next(&self, worker_id: &str) -> Result<Option<MissionQueueRow>, PersistenceError>;
+
+    /// Update `heartbeat_at` for a claimed row. No-op if the row moved.
+    async fn heartbeat(&self, id: i64) -> Result<(), PersistenceError>;
+
+    /// Terminal state — `error` populated iff `success=false`.
+    async fn finish(&self, id: i64, success: bool, error: Option<&str>) -> Result<(), PersistenceError>;
+
+    /// Requeue any `Claimed` row whose heartbeat is older than
+    /// `stale_after_secs` OR whose `heartbeat_at IS NULL` and was claimed
+    /// more than `stale_after_secs` ago. Returns the number requeued.
+    /// Called at boot and periodically to recover from worker crashes.
+    async fn requeue_stale(&self, stale_after_secs: i64) -> Result<usize, PersistenceError>;
+
+    /// Live snapshot: (queued_count, claimed_count).
+    async fn depth(&self) -> Result<(usize, usize), PersistenceError>;
+
+    /// Most-recent N rows (any status), newest first.
+    async fn recent(&self, limit: usize) -> Result<Vec<MissionQueueRow>, PersistenceError>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4f — Organizational memory.
+// ---------------------------------------------------------------------------
+
+/// One durable fact learned across missions. `tags` is used for cheap
+/// keyword-based recall in the planner prompt (LIKE-search on the JSON
+/// array of lowercased strings). `retired_at` is set by the UI to hide a
+/// memory without deleting it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OrgMemoryRow {
+    pub id:                i64,
+    pub key:               String,
+    pub value:             String,
+    pub tags:              Vec<String>,
+    pub source_mission_id: Option<String>,
+    pub created_at:        String,
+    pub retired_at:        Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewOrgMemory {
+    pub key:               String,
+    pub value:             String,
+    pub tags:              Vec<String>,
+    pub source_mission_id: Option<MissionId>,
+}
+
+#[async_trait]
+pub trait OrgMemoryRepository: Send + Sync {
+    /// Append a new memory row.
+    async fn insert(&self, m: &NewOrgMemory) -> Result<i64, PersistenceError>;
+
+    /// Soft-delete: sets retired_at. No-op on already-retired or missing.
+    async fn retire(&self, id: i64) -> Result<bool, PersistenceError>;
+
+    /// All non-retired rows, newest first.
+    async fn list_active(&self, limit: usize) -> Result<Vec<OrgMemoryRow>, PersistenceError>;
+
+    /// Return up to `limit` non-retired rows whose key/value/tags contain
+    /// ANY of the given keywords (case-insensitive), scored by match
+    /// count. Empty keyword list returns an empty vec.
+    async fn search(&self, keywords: &[String], limit: usize) -> Result<Vec<OrgMemoryRow>, PersistenceError>;
+}
+
 pub use sqlite::{
-    connect, SqliteEventStore, SqliteGoalRepository, SqliteMissionRepository, SqlitePool,
+    connect, SqliteEventStore, SqliteGoalRepository, SqliteMissionRepository,
+    SqliteMissionQueueRepository, SqliteOrgMemoryRepository, SqlitePool,
     SqliteReflectionRepository, SqliteSkillHistoryRepository, SqliteTaskRepository,
 };
+
+/// Postgres scaffold for the Phase 4e persistence swap point.
+/// Compiles as a stub that returns `NotYetImplemented` from `connect`.
+/// See `crates/forge-persistence/src/postgres.rs` for the roadmap.
+pub mod postgres;
+
+// ---------------------------------------------------------------------------
+// Phase 4e — Persistence composite handle.
+// ---------------------------------------------------------------------------
+
+/// One handle bundling every repository trait. Runtime wires this once at
+/// boot; nothing else in the codebase touches concrete `SqlitePool` types.
+///
+/// To swap in Postgres, implement a `PersistenceHandles::postgres(url)`
+/// constructor that mirrors `sqlite(url)`. Everything downstream is
+/// already trait-based.
+#[derive(Clone)]
+pub struct PersistenceHandles {
+    pub pool_kind: PoolKind,
+    pub events:      std::sync::Arc<dyn EventStore>,
+    pub missions:    std::sync::Arc<dyn MissionRepository>,
+    pub goals:       std::sync::Arc<dyn GoalRepository>,
+    pub tasks:       std::sync::Arc<dyn TaskRepository>,
+    pub reflections: std::sync::Arc<dyn ReflectionRepository>,
+    pub skills:      std::sync::Arc<dyn SkillHistoryRepository>,
+    pub queue:       std::sync::Arc<dyn MissionQueueRepository>,
+    pub memory:      std::sync::Arc<dyn OrgMemoryRepository>,
+    /// The raw SQLite pool, if this handle bundle was built via
+    /// `sqlite()`. `None` when the backend is Postgres — callers that
+    /// need to run raw SQLite queries (e.g. shadow-git snapshots) should
+    /// use this to opt into single-backend behaviour.
+    pub sqlite_pool: Option<SqlitePool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolKind { Sqlite, Postgres }
+
+impl PersistenceHandles {
+    /// Build the full trait bundle backed by SQLite at the given URL.
+    /// This is the normal boot path.
+    pub async fn sqlite(url: &str) -> Result<Self, PersistenceError> {
+        let pool = connect(url).await?;
+        use std::sync::Arc;
+        Ok(Self {
+            pool_kind: PoolKind::Sqlite,
+            events:      Arc::new(SqliteEventStore::new(pool.clone())),
+            missions:    Arc::new(SqliteMissionRepository::new(pool.clone())),
+            goals:       Arc::new(SqliteGoalRepository::new(pool.clone())),
+            tasks:       Arc::new(SqliteTaskRepository::new(pool.clone())),
+            reflections: Arc::new(SqliteReflectionRepository::new(pool.clone())),
+            skills:      Arc::new(SqliteSkillHistoryRepository::new(pool.clone())),
+            queue:       Arc::new(SqliteMissionQueueRepository::new(pool.clone())),
+            memory:      Arc::new(SqliteOrgMemoryRepository::new(pool.clone())),
+            sqlite_pool: Some(pool),
+        })
+    }
+
+    /// Build the full trait bundle backed by Postgres. Currently returns
+    /// a `NotYetImplemented` error — the trait boundary is proven, the
+    /// concrete impl is Phase 5 work.
+    pub async fn postgres(url: &str) -> Result<Self, PersistenceError> {
+        let _ = postgres::connect(url).await?;
+        Err(PersistenceError::NotYetImplemented("postgres persistence backend"))
+    }
+
+    /// Dispatch by URL scheme:
+    ///   sqlite://…, file:…, or a bare path → SQLite
+    ///   postgres://…, postgresql://…       → Postgres (stub)
+    pub async fn open(url: &str) -> Result<Self, PersistenceError> {
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            Self::postgres(url).await
+        } else {
+            Self::sqlite(url).await
+        }
+    }
+}

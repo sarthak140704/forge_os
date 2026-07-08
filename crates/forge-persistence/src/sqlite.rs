@@ -36,6 +36,18 @@ pub async fn connect(url: &str) -> Result<SqlitePool, PersistenceError> {
         if s.is_empty() { continue; }
         sqlx::query(s).execute(&pool).await?;
     }
+    // Phase 4d: persisted mission-execution queue.
+    for stmt in migrations::V003_MISSION_QUEUE.split(';') {
+        let s = stmt.trim();
+        if s.is_empty() { continue; }
+        sqlx::query(s).execute(&pool).await?;
+    }
+    // Phase 4f: organizational memory.
+    for stmt in migrations::V004_ORG_MEMORY.split(';') {
+        let s = stmt.trim();
+        if s.is_empty() { continue; }
+        sqlx::query(s).execute(&pool).await?;
+    }
     Ok(pool)
 }
 
@@ -678,5 +690,356 @@ impl crate::SkillHistoryRepository for SqliteSkillHistoryRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(parse_history_row).collect())
+    }
+}
+
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 4d — mission execution queue
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct SqliteMissionQueueRepository { pool: SqlitePool }
+impl SqliteMissionQueueRepository {
+    pub fn new(pool: SqlitePool) -> Self { Self { pool } }
+}
+
+fn parse_queue_row(r: sqlx::sqlite::SqliteRow) -> crate::MissionQueueRow {
+    crate::MissionQueueRow {
+        id:           r.try_get::<i64, _>("id").unwrap_or_default(),
+        mission_id:   r.try_get::<String, _>("mission_id").unwrap_or_default(),
+        status:       crate::QueueStatus::parse(&r.try_get::<String, _>("status").unwrap_or_default()),
+        claimed_by:   r.try_get::<Option<String>, _>("claimed_by").unwrap_or(None),
+        claimed_at:   r.try_get::<Option<String>, _>("claimed_at").unwrap_or(None),
+        heartbeat_at: r.try_get::<Option<String>, _>("heartbeat_at").unwrap_or(None),
+        finished_at:  r.try_get::<Option<String>, _>("finished_at").unwrap_or(None),
+        error:        r.try_get::<Option<String>, _>("error").unwrap_or(None),
+        enqueued_at:  r.try_get::<String, _>("enqueued_at").unwrap_or_default(),
+    }
+}
+
+#[async_trait]
+impl crate::MissionQueueRepository for SqliteMissionQueueRepository {
+    async fn enqueue(&self, mission_id: MissionId) -> Result<i64, PersistenceError> {
+        let mid = mission_id.to_string();
+        // If an active (Queued|Claimed) row exists for this mission, reuse it.
+        if let Some(row) = sqlx::query(
+            "SELECT id FROM mission_queue WHERE mission_id=?1 AND status IN ('queued','claimed') ORDER BY id ASC LIMIT 1",
+        )
+        .bind(&mid)
+        .fetch_optional(&self.pool)
+        .await? {
+            return Ok(row.try_get::<i64, _>("id")?);
+        }
+        let now = ts_to_str(OffsetDateTime::now_utc());
+        let res = sqlx::query(
+            "INSERT INTO mission_queue (mission_id, status, enqueued_at) VALUES (?1, 'queued', ?2)",
+        )
+        .bind(&mid)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    async fn claim_next(&self, worker_id: &str) -> Result<Option<crate::MissionQueueRow>, PersistenceError> {
+        // SQLite doesn't support UPDATE...RETURNING in every distribution,
+        // so we do the claim in a transaction: SELECT the oldest queued row,
+        // then UPDATE it if its status is still 'queued'.
+        let mut tx = self.pool.begin().await?;
+        let row_opt = sqlx::query(
+            "SELECT id FROM mission_queue WHERE status='queued' ORDER BY id ASC LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row_opt else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let id: i64 = row.try_get("id")?;
+        let now = ts_to_str(OffsetDateTime::now_utc());
+        let n = sqlx::query(
+            "UPDATE mission_queue SET status='claimed', claimed_by=?1, claimed_at=?2, heartbeat_at=?2 \
+             WHERE id=?3 AND status='queued'",
+        )
+        .bind(worker_id)
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            // Lost the race — someone else claimed it. Return None; the
+            // worker will loop and try again.
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let full = sqlx::query(
+            "SELECT id, mission_id, status, claimed_by, claimed_at, heartbeat_at, finished_at, error, enqueued_at \
+             FROM mission_queue WHERE id=?1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(parse_queue_row(full)))
+    }
+
+    async fn heartbeat(&self, id: i64) -> Result<(), PersistenceError> {
+        let now = ts_to_str(OffsetDateTime::now_utc());
+        sqlx::query(
+            "UPDATE mission_queue SET heartbeat_at=?1 WHERE id=?2 AND status='claimed'",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn finish(&self, id: i64, success: bool, error: Option<&str>) -> Result<(), PersistenceError> {
+        let now = ts_to_str(OffsetDateTime::now_utc());
+        let status = if success { "done" } else { "failed" };
+        sqlx::query(
+            "UPDATE mission_queue SET status=?1, finished_at=?2, error=?3 WHERE id=?4",
+        )
+        .bind(status)
+        .bind(now)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn requeue_stale(&self, stale_after_secs: i64) -> Result<usize, PersistenceError> {
+        // SQLite stores our timestamps as ISO-8601 strings; we compare
+        // string-wise against a cutoff timestamp we compute in Rust.
+        let cutoff = ts_to_str(OffsetDateTime::now_utc() - time::Duration::seconds(stale_after_secs));
+        let res = sqlx::query(
+            "UPDATE mission_queue \
+             SET status='queued', claimed_by=NULL, claimed_at=NULL, heartbeat_at=NULL \
+             WHERE status='claimed' AND (heartbeat_at IS NULL OR heartbeat_at < ?1)",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() as usize)
+    }
+
+    async fn depth(&self) -> Result<(usize, usize), PersistenceError> {
+        let row = sqlx::query(
+            "SELECT \
+               SUM(CASE WHEN status='queued'  THEN 1 ELSE 0 END) AS q, \
+               SUM(CASE WHEN status='claimed' THEN 1 ELSE 0 END) AS c \
+             FROM mission_queue",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let q: Option<i64> = row.try_get("q").ok();
+        let c: Option<i64> = row.try_get("c").ok();
+        Ok((q.unwrap_or(0) as usize, c.unwrap_or(0) as usize))
+    }
+
+    async fn recent(&self, limit: usize) -> Result<Vec<crate::MissionQueueRow>, PersistenceError> {
+        let rows = sqlx::query(
+            "SELECT id, mission_id, status, claimed_by, claimed_at, heartbeat_at, finished_at, error, enqueued_at \
+             FROM mission_queue ORDER BY id DESC LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(parse_queue_row).collect())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 4f — organizational memory
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct SqliteOrgMemoryRepository { pool: SqlitePool }
+impl SqliteOrgMemoryRepository {
+    pub fn new(pool: SqlitePool) -> Self { Self { pool } }
+}
+
+fn parse_memory_row(r: sqlx::sqlite::SqliteRow) -> crate::OrgMemoryRow {
+    let tags_json: String = r.try_get::<String, _>("tags").unwrap_or_else(|_| "[]".into());
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    crate::OrgMemoryRow {
+        id:                r.try_get::<i64, _>("id").unwrap_or_default(),
+        key:               r.try_get::<String, _>("key").unwrap_or_default(),
+        value:             r.try_get::<String, _>("value").unwrap_or_default(),
+        tags,
+        source_mission_id: r.try_get::<Option<String>, _>("source_mission_id").unwrap_or(None),
+        created_at:        r.try_get::<String, _>("created_at").unwrap_or_default(),
+        retired_at:        r.try_get::<Option<String>, _>("retired_at").unwrap_or(None),
+    }
+}
+
+#[async_trait]
+impl crate::OrgMemoryRepository for SqliteOrgMemoryRepository {
+    async fn insert(&self, m: &crate::NewOrgMemory) -> Result<i64, PersistenceError> {
+        let tags_json = serde_json::to_string(&m.tags)?;
+        let now = ts_to_str(OffsetDateTime::now_utc());
+        let src = m.source_mission_id.map(|id| id.to_string());
+        let res = sqlx::query(
+            "INSERT INTO org_memory (key, value, tags, source_mission_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&m.key)
+        .bind(&m.value)
+        .bind(tags_json)
+        .bind(src)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    async fn retire(&self, id: i64) -> Result<bool, PersistenceError> {
+        let now = ts_to_str(OffsetDateTime::now_utc());
+        let res = sqlx::query(
+            "UPDATE org_memory SET retired_at=?1 WHERE id=?2 AND retired_at IS NULL",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn list_active(&self, limit: usize) -> Result<Vec<crate::OrgMemoryRow>, PersistenceError> {
+        let rows = sqlx::query(
+            "SELECT id, key, value, tags, source_mission_id, created_at, retired_at \
+             FROM org_memory WHERE retired_at IS NULL ORDER BY id DESC LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(parse_memory_row).collect())
+    }
+
+    async fn search(&self, keywords: &[String], limit: usize) -> Result<Vec<crate::OrgMemoryRow>, PersistenceError> {
+        if keywords.is_empty() {
+            return Ok(vec![]);
+        }
+        // Build an OR of LIKE clauses over (key, value, tags). Score by
+        // sum-of-matches computed in Rust after fetch. `LIKE` is
+        // case-insensitive for ASCII in SQLite; we lowercase the keyword
+        // and rely on that being close enough for a personal-project MVP.
+        let mut where_clauses = Vec::with_capacity(keywords.len() * 3);
+        let mut binds: Vec<String> = Vec::with_capacity(keywords.len() * 3);
+        for kw in keywords {
+            let pat = format!("%{}%", kw.to_lowercase());
+            where_clauses.push("(LOWER(key) LIKE ? OR LOWER(value) LIKE ? OR LOWER(tags) LIKE ?)".to_string());
+            binds.push(pat.clone());
+            binds.push(pat.clone());
+            binds.push(pat);
+        }
+        let sql = format!(
+            "SELECT id, key, value, tags, source_mission_id, created_at, retired_at \
+             FROM org_memory WHERE retired_at IS NULL AND ({}) ORDER BY id DESC LIMIT ?",
+            where_clauses.join(" OR "),
+        );
+        let mut q = sqlx::query(&sql);
+        for b in &binds { q = q.bind(b); }
+        q = q.bind(limit as i64);
+        let rows = q.fetch_all(&self.pool).await?;
+        // Score client-side: count of keyword hits across (key+value+tags).
+        let mut scored: Vec<(usize, crate::OrgMemoryRow)> = rows.into_iter().map(|r| {
+            let row = parse_memory_row(r);
+            let hay = format!("{} {} {}", row.key.to_lowercase(), row.value.to_lowercase(), row.tags.join(" ").to_lowercase());
+            let score = keywords.iter().filter(|k| hay.contains(&k.to_lowercase())).count();
+            (score, row)
+        }).collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+        Ok(scored.into_iter().map(|(_, r)| r).collect())
+    }
+}
+
+#[cfg(test)]
+mod queue_and_memory_tests {
+    use super::*;
+    use crate::{MissionQueueRepository, OrgMemoryRepository, NewOrgMemory};
+    use forge_domain::MissionId;
+
+    async fn fresh_pool() -> SqlitePool {
+        connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn queue_enqueue_is_idempotent_on_active_mission() {
+        let pool = fresh_pool().await;
+        let repo = SqliteMissionQueueRepository::new(pool);
+        let mid = MissionId::new();
+        let a = repo.enqueue(mid).await.unwrap();
+        let b = repo.enqueue(mid).await.unwrap();
+        assert_eq!(a, b, "second enqueue of the same active mission returned different id");
+    }
+
+    #[tokio::test]
+    async fn queue_claim_and_finish_flow() {
+        let pool = fresh_pool().await;
+        let repo = SqliteMissionQueueRepository::new(pool);
+        let m1 = MissionId::new();
+        let m2 = MissionId::new();
+        repo.enqueue(m1).await.unwrap();
+        repo.enqueue(m2).await.unwrap();
+        // Two workers claim in order.
+        let c1 = repo.claim_next("w1").await.unwrap().unwrap();
+        let c2 = repo.claim_next("w2").await.unwrap().unwrap();
+        assert_ne!(c1.id, c2.id);
+        assert_eq!(c1.mission_id, m1.to_string());
+        // Empty now.
+        assert!(repo.claim_next("w3").await.unwrap().is_none());
+        // Heartbeat + finish.
+        repo.heartbeat(c1.id).await.unwrap();
+        repo.finish(c1.id, true, None).await.unwrap();
+        repo.finish(c2.id, false, Some("boom")).await.unwrap();
+        let (q, c) = repo.depth().await.unwrap();
+        assert_eq!((q, c), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn queue_requeues_stale_claims() {
+        let pool = fresh_pool().await;
+        let repo = SqliteMissionQueueRepository::new(pool);
+        let m = MissionId::new();
+        repo.enqueue(m).await.unwrap();
+        let c = repo.claim_next("w1").await.unwrap().unwrap();
+        assert_eq!(c.status, crate::QueueStatus::Claimed);
+        // stale_after=0 → any claimed row (heartbeat is exactly `now`, so
+        // string-wise < now-INTERVAL is only guaranteed for very small
+        // negative intervals). Use -1 to force requeue.
+        let n = repo.requeue_stale(-1).await.unwrap();
+        assert_eq!(n, 1);
+        let (q, cc) = repo.depth().await.unwrap();
+        assert_eq!((q, cc), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn memory_insert_search_retire() {
+        let pool = fresh_pool().await;
+        let repo = SqliteOrgMemoryRepository::new(pool);
+        let id = repo.insert(&NewOrgMemory {
+            key:               "python_test_runner".into(),
+            value:             "This repo uses pytest -q via a venv at .venv/".into(),
+            tags:              vec!["python".into(), "testing".into()],
+            source_mission_id: None,
+        }).await.unwrap();
+        let _ = repo.insert(&NewOrgMemory {
+            key:               "unrelated".into(),
+            value:             "totally different subject matter".into(),
+            tags:              vec!["misc".into()],
+            source_mission_id: None,
+        }).await.unwrap();
+        let hits = repo.search(&["python".into()], 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "python_test_runner");
+        // Empty keywords → empty
+        assert!(repo.search(&[], 10).await.unwrap().is_empty());
+        // Retire hides from list_active
+        assert!(repo.retire(id).await.unwrap());
+        let active = repo.list_active(10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].key, "unrelated");
     }
 }

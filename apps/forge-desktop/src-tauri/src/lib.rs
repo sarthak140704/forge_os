@@ -29,6 +29,10 @@ struct AppState {
     pool: sqlx::SqlitePool,
     skill_ops: Option<Arc<SkillOps>>,
     curator:   Option<Arc<Curator>>,
+    // Phase 4d/4f observability handles
+    queue:        Arc<dyn forge_persistence::MissionQueueRepository>,
+    org_memory:   Arc<dyn forge_persistence::OrgMemoryRepository>,
+    worker_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +49,12 @@ async fn create_mission(
     description: String,
 ) -> Result<IpcMissionId, String> {
     let id = state.missions.create(title, description).await.map_err(|e| e.to_string())?;
-    Ok(IpcMissionId { id: id.to_string() })
+    // NOTE: MissionId's `Display` impl prefixes with `msn_`, but
+    // `#[serde(transparent)]` serializes it as a raw UUID. Every event
+    // payload + list_missions row uses the raw UUID form, so if we return
+    // the prefixed form here the frontend's auto-select would mismatch
+    // event mission_ids forever. Return the raw UUID so the two agree.
+    Ok(IpcMissionId { id: id.as_uuid().to_string() })
 }
 
 #[tauri::command]
@@ -349,6 +358,51 @@ async fn validate_skill_proposal(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4d — mission queue observability
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct QueueStatusIpc {
+    workers:  usize,
+    queued:   usize,
+    claimed:  usize,
+    recent:   Vec<forge_persistence::MissionQueueRow>,
+}
+
+#[tauri::command]
+async fn queue_status(state: State<'_, Arc<AppState>>) -> Result<QueueStatusIpc, String> {
+    let (queued, claimed) = state.queue.depth().await.map_err(|e| e.to_string())?;
+    let recent = state.queue.recent(20).await.map_err(|e| e.to_string())?;
+    Ok(QueueStatusIpc {
+        workers: state.worker_count,
+        queued,
+        claimed,
+        recent,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4f — organizational memory
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn list_org_memory(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<usize>,
+) -> Result<Vec<forge_persistence::OrgMemoryRow>, String> {
+    let n = limit.unwrap_or(200).min(1000);
+    state.org_memory.list_active(n).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_org_memory(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<bool, String> {
+    state.org_memory.retire(id).await.map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // App entry
 // ---------------------------------------------------------------------------
 
@@ -408,6 +462,9 @@ pub fn run() {
             run_curator,
             curator_scan,
             validate_skill_proposal,
+            queue_status,
+            list_org_memory,
+            delete_org_memory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
@@ -481,6 +538,9 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         curator: Default::default(),
         curator_sweep_enabled: false,
         curator_interval_secs: 900,
+        workers: 2,
+        worker_stale_secs: 120,
+        org_memory_enabled: true,
     };
     // On first run, seed the skills dir from the bundled defaults if it's empty.
     let skills_root = app_data.join("skills").join("active");
@@ -503,6 +563,7 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         let _ = std::fs::write(&mcp_path, seed);
     }
     let runtime = Runtime::boot(config).await?;
+    let worker_count = runtime.config.workers;
     Ok(Arc::new(AppState {
         missions: runtime.missions,
         events: runtime.events,
@@ -511,6 +572,9 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         pool: runtime.pool,
         skill_ops: runtime.skill_ops,
         curator:   runtime.curator,
+        queue:      runtime.queue,
+        org_memory: runtime.org_memory,
+        worker_count,
     }))
 }
 

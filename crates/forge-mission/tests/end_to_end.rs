@@ -105,6 +105,8 @@ async fn end_to_end_mock_llm_writes_file() {
         project_memory: None,
         llm_router: None,
         episodic_recall: None,
+        queue: None,
+        org_memory: None,
     };
 
     let mid = svc

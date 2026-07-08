@@ -236,6 +236,39 @@ pub enum ForgeEvent {
         source_b:          String,
         body_similarity:   f64,
     },
+
+    // ---- Phase 4d: mission execution queue ----
+
+    /// A mission was placed on the persisted execution queue. The
+    /// worker pool will claim it in FIFO order. Emitted only when the
+    /// runtime is configured with a queue (i.e. `workers >= 1`);
+    /// otherwise `plan_and_run` continues to spawn a background task
+    /// directly and this event never fires.
+    MissionQueued {
+        mission_id: MissionId,
+        queue_id:   i64,
+    },
+
+    // ---- Phase 4f: organizational memory ----
+
+    /// The planner surfaced one or more prior-learning rows from
+    /// `org_memory` when planning this mission. `block_preview` is the
+    /// first 240 chars of the formatted planner block so operators can
+    /// see what influenced the plan without querying the DB.
+    OrgMemoryRecalled {
+        mission_id:    MissionId,
+        block_preview: String,
+    },
+
+    /// A reflection insight was persisted as a durable org-memory row.
+    /// Emitted once per insight, so a mission with 3 insights emits 3
+    /// of these. `memory_id` is the newly-inserted row id (usable via
+    /// the `delete_org_memory` IPC).
+    OrgMemoryLearned {
+        mission_id: MissionId,
+        memory_id:  i64,
+        key:        String,
+    },
 }
 
 impl ForgeEvent {
@@ -293,6 +326,10 @@ impl ForgeEvent {
 
             SkillAutoArchived { archived_name, .. } => format!("skill_{archived_name}"),
             SkillMergeProposed { merged_name, .. } => format!("skill_{merged_name}"),
+
+            MissionQueued { mission_id, .. }
+            | OrgMemoryRecalled { mission_id, .. }
+            | OrgMemoryLearned { mission_id, .. } => mission_id.to_string(),
         }
     }
 
@@ -342,6 +379,10 @@ impl ForgeEvent {
             | SkillAutoPromoted { .. }
             | SkillAutoArchived { .. }
             | SkillMergeProposed { .. } => AggregateKind::Skill,
+
+            MissionQueued { .. }
+            | OrgMemoryRecalled { .. }
+            | OrgMemoryLearned { .. } => AggregateKind::Mission,
         }
     }
 
@@ -392,6 +433,10 @@ impl ForgeEvent {
             SkillAutoPromoted { .. } => "skill_auto_promoted",
             SkillAutoArchived { .. } => "skill_auto_archived",
             SkillMergeProposed { .. } => "skill_merge_proposed",
+
+            MissionQueued { .. }      => "mission_queued",
+            OrgMemoryRecalled { .. }  => "org_memory_recalled",
+            OrgMemoryLearned { .. }   => "org_memory_learned",
         }
     }
 }
