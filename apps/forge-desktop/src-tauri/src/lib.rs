@@ -10,7 +10,7 @@ use forge_domain::{ForgeEvent, MissionId, MissionSummary, TaskId};
 use forge_events::EventBus;
 use forge_mission::{MissionDetail, MissionService};
 use forge_runtime::{
-    skills_ops::{Curator, CuratorSuggestion, SkillOps},
+    skills_ops::{Curator, CuratorReport, CuratorSuggestion, SkillOps},
     Checkpoint, CheckpointStore, LlmConfig, LlmProviderConfig, Runtime, RuntimeConfig,
 };
 use serde::Serialize;
@@ -326,6 +326,19 @@ async fn run_curator(state: State<'_, Arc<AppState>>) -> Result<Vec<CuratorSugge
     curator.run().await.map_err(|e| e.to_string())
 }
 
+/// Phase 4c: full curator scan. `apply=false` returns suggestions only;
+/// `apply=true` also archives duplicate losers and drops merge proposals
+/// into `proposed/`. Never destructive — archived skills are recoverable
+/// via rollback because the content-addressed store keeps every version.
+#[tauri::command]
+async fn curator_scan(
+    state: State<'_, Arc<AppState>>,
+    apply: bool,
+) -> Result<CuratorReport, String> {
+    let curator = require_curator(&state)?;
+    curator.scan(apply).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn validate_skill_proposal(
     state: State<'_, Arc<AppState>>,
@@ -393,6 +406,7 @@ pub fn run() {
             rollback_skill,
             retire_skill,
             run_curator,
+            curator_scan,
             validate_skill_proposal,
         ])
         .run(tauri::generate_context!())
@@ -464,6 +478,9 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         mcp_config: Some(app_data.join("mcp.yaml")),
         auto_promote_skills: false,
         autopromote_interval_secs: 300,
+        curator: Default::default(),
+        curator_sweep_enabled: false,
+        curator_interval_secs: 900,
     };
     // On first run, seed the skills dir from the bundled defaults if it's empty.
     let skills_root = app_data.join("skills").join("active");

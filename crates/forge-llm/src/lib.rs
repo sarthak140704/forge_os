@@ -228,6 +228,7 @@ impl LlmRouter {
         let sink_opt = self.sink.read().clone();
         let mut last_err: Option<String> = None;
         let mut last_provider: Option<String> = None;
+        let mut all_errs: Vec<String> = Vec::new();
 
         match self.strategy {
             RoutingStrategy::FailoverInOrder => {
@@ -280,14 +281,20 @@ impl LlmRouter {
                                 }).await;
                             }
                             last_provider = Some(p.name().to_string());
-                            last_err = Some(msg);
+                            last_err = Some(msg.clone());
+                            all_errs.push(format!("[{}] {}", p.name(), msg));
                         }
                     }
                 }
             }
         }
         let _ = last_provider;
-        Err(LlmError::AllFailed(last_err.unwrap_or_else(|| "no attempt made".into())))
+        let combined = if all_errs.is_empty() {
+            last_err.unwrap_or_else(|| "no attempt made".into())
+        } else {
+            all_errs.join(" | ")
+        };
+        Err(LlmError::AllFailed(combined))
     }
 
     pub fn provider_names(&self) -> Vec<String> {

@@ -15,10 +15,12 @@ import {
   revertCheckpoint,
   rollbackSkill,
   runCurator,
+  curatorScan,
   setSecret,
   validateSkillProposal,
   type Checkpoint,
   type CuratorSuggestion,
+  type CuratorReport,
   type SecretStatus,
   type SkillProposalSummary,
   type SkillVersion,
@@ -251,6 +253,7 @@ function SkillsSection() {
   const active     = useQuery({ queryKey: ["skills-active"], queryFn: listActiveSkills });
   const proposals  = useQuery({ queryKey: ["skills-proposals"], queryFn: listSkillProposals });
   const [suggestions, setSuggestions] = useState<CuratorSuggestion[] | null>(null);
+  const [report, setReport] = useState<CuratorReport | null>(null);
   const [busy, setBusy] = useState(false);
 
   const invalidate = () => {
@@ -260,8 +263,19 @@ function SkillsSection() {
 
   const doRunCurator = async () => {
     setBusy(true);
-    try { setSuggestions(await runCurator()); }
+    try { setSuggestions(await runCurator()); setReport(null); }
     catch (e) { alert(`Curator failed: ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  const doScan = async (apply: boolean) => {
+    setBusy(true);
+    try {
+      const r = await curatorScan(apply);
+      setReport(r);
+      setSuggestions(r.suggestions);
+      if (apply) invalidate();
+    } catch (e) { alert(`Scan failed: ${String(e)}`); }
     finally { setBusy(false); }
   };
 
@@ -270,9 +284,20 @@ function SkillsSection() {
       title="Skills"
       hint="Version-controlled procedural knowledge. Every promotion is validated; every rollback is bit-exact."
     >
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <Button variant="ghost" onClick={invalidate}>Refresh</Button>
-        <Button onClick={doRunCurator} disabled={busy}>Run curator</Button>
+        <Button variant="ghost" onClick={doRunCurator} disabled={busy}>Advisory scan</Button>
+        <Button variant="ghost" onClick={() => doScan(false)} disabled={busy}>Scan (dry-run)</Button>
+        <Button
+          onClick={() => {
+            if (confirm("Apply curator actions? This will archive duplicate skills and drop merge proposals into `proposed/`. Both are reversible via rollback / rejecting the proposal.")) {
+              doScan(true);
+            }
+          }}
+          disabled={busy}
+        >
+          Scan & apply
+        </Button>
       </div>
 
       {/* Proposals */}
@@ -303,6 +328,31 @@ function SkillsSection() {
         </div>
       </div>
 
+      {/* Curator report — actions taken */}
+      {report && (report.auto_archived.length > 0 || report.merge_proposals.length > 0) && (
+        <div>
+          <div className="text-xs font-semibold text-forge-muted mb-2">
+            Curator actions ({report.auto_archived.length + report.merge_proposals.length})
+          </div>
+          <div className="space-y-1">
+            {report.auto_archived.map(([lost, kept], i) => (
+              <div key={`arch-${i}`} className="text-xs">
+                <Badge tone="warn">archived</Badge>
+                <span className="ml-2 font-mono">{lost}</span>
+                <span className="ml-2 text-forge-muted">— kept `{kept}`</span>
+              </div>
+            ))}
+            {report.merge_proposals.map((f, i) => (
+              <div key={`merge-${i}`} className="text-xs">
+                <Badge tone="info">merge proposal</Badge>
+                <span className="ml-2 font-mono">{f}</span>
+                <span className="ml-2 text-forge-muted">— review under Pending proposals above</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Curator suggestions */}
       {suggestions && (
         <div>
@@ -313,7 +363,7 @@ function SkillsSection() {
           <div className="space-y-2">
             {suggestions.map((s, i) => (
               <div key={i} className="p-2 rounded border border-forge-border bg-forge-panel/40 text-xs">
-                <Badge tone={s.kind === "duplicate" ? "warn" : "info"}>{s.kind}</Badge>
+                <Badge tone={s.kind === "duplicate" ? "warn" : s.kind === "merge_candidate" ? "info" : "default"}>{s.kind}</Badge>
                 <span className="ml-2 font-mono">{s.name}</span>
                 <span className="ml-2 text-forge-muted">— {s.evidence}</span>
               </div>

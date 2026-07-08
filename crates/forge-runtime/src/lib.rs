@@ -189,9 +189,23 @@ pub struct RuntimeConfig {
     /// `auto_promote_skills` is false. Defaults to 5 minutes.
     #[serde(default = "default_autopromote_interval_secs")]
     pub autopromote_interval_secs: u64,
+    /// Phase 4c: curator policy — thresholds + auto_act flag.
+    #[serde(default)]
+    pub curator: skills_ops::CuratorPolicy,
+    /// Phase 4c: if true, spawn a periodic curator sweep that honors
+    /// `curator.auto_act`. Off by default; the IPC scan endpoint still
+    /// works with this off.
+    #[serde(default)]
+    pub curator_sweep_enabled: bool,
+    /// Interval between curator sweeps. Ignored when
+    /// `curator_sweep_enabled` is false. Defaults to 15 minutes — merges
+    /// and archives should be rare so the loop can be gentle.
+    #[serde(default = "default_curator_interval_secs")]
+    pub curator_interval_secs: u64,
 }
 fn default_max_parallel() -> usize { 4 }
 fn default_autopromote_interval_secs() -> u64 { 300 }
+fn default_curator_interval_secs() -> u64 { 900 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LlmConfig {
@@ -598,7 +612,9 @@ impl Runtime {
             // Rebuild the event-store handle for the curator (need EventStore,
             // not the bus). Cheap Arc clone.
             let curator_events = Arc::new(SqliteEventStore::new(pool.clone()));
-            let curator = Arc::new(skills_ops::Curator::new(ops.clone(), curator_events));
+            let curator = Arc::new(skills_ops::Curator::with_policy(
+                ops.clone(), curator_events, config.curator.clone(),
+            ));
 
             // Phase 4b: optional autopromoter background loop.
             if config.auto_promote_skills {
@@ -609,6 +625,19 @@ impl Runtime {
                     "autopromoter enabled — proposals passing validation will be promoted without approval"
                 );
                 promoter.spawn();
+            }
+
+            // Phase 4c: optional curator sweep loop.
+            if config.curator_sweep_enabled {
+                let interval = std::time::Duration::from_secs(config.curator_interval_secs.max(60));
+                let apply    = config.curator.auto_act;
+                let sweeper  = Arc::new(skills_ops::CuratorSweeper::new(curator.clone(), interval, apply));
+                tracing::info!(
+                    interval_s = interval.as_secs(),
+                    apply,
+                    "curator sweep enabled",
+                );
+                sweeper.spawn();
             }
 
             (Some(ops), Some(curator))

@@ -79,6 +79,8 @@ export function eventMissionId(
     case "skill_validation_passed":
     case "skill_validation_failed":
     case "skill_auto_promoted":
+    case "skill_auto_archived":
+    case "skill_merge_proposed":
       return null;
     default:
       return null;

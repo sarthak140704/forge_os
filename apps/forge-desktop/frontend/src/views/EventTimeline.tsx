@@ -52,6 +52,8 @@ function summarize(e: ForgeEvent): string {
     case "skill_validation_passed": return `Skill validation passed: ${e.name}${e.soft_failures.length ? ` (warnings: ${e.soft_failures.join(", ")})` : ""}`;
     case "skill_validation_failed": return `Skill validation FAILED: ${e.name} — ${e.failed_checks.join(", ")}`;
     case "skill_auto_promoted": return `Skill AUTO-promoted: ${e.name} v${e.version} (${e.sha.slice(0, 8)})`;
+    case "skill_auto_archived": return `Curator AUTO-archived: ${e.archived_name} (kept ${e.kept_name}, sim=${e.similarity.toFixed(3)}, rule=${e.rule})`;
+    case "skill_merge_proposed": return `Curator merge proposal: ${e.merged_name} = ${e.source_a} + ${e.source_b} (sim=${e.body_similarity.toFixed(3)})`;
     default: return JSON.stringify(e);
   }
 }

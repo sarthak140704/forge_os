@@ -105,7 +105,9 @@ export type ForgeEvent =
   | { type: "skill_curation_suggested"; name: string; kind: string; evidence: string }
   | { type: "skill_validation_passed"; filename: string; name: string; soft_failures: string[] }
   | { type: "skill_validation_failed"; filename: string; name: string; failed_checks: string[] }
-  | { type: "skill_auto_promoted"; name: string; sha: string; version: string };
+  | { type: "skill_auto_promoted"; name: string; sha: string; version: string }
+  | { type: "skill_auto_archived"; archived_name: string; archived_sha: string; kept_name: string; similarity: number; rule: string }
+  | { type: "skill_merge_proposed"; proposal_filename: string; merged_name: string; source_a: string; source_b: string; body_similarity: number };
 
 export interface EventEnvelope {
   seq: number;

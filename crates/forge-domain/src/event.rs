@@ -206,6 +206,36 @@ pub enum ForgeEvent {
         sha:     String,
         version: String,
     },
+
+    // ---- Phase 4c: actionable curator ----
+
+    /// The curator archived the loser of a near-duplicate pair without
+    /// human approval. Fires only when the runtime is configured with
+    /// `curator_auto_act = true`. A companion `SkillRetired` event is also
+    /// published — this variant exists so the timeline distinguishes
+    /// "human clicked retire" from "curator archived on its own" and
+    /// records the sibling that was kept.
+    SkillAutoArchived {
+        archived_name:   String,
+        archived_sha:    String,
+        kept_name:       String,
+        similarity:      f64,
+        /// One of: `name_similar`, `body_similar`, `subset_of`.
+        rule:            String,
+    },
+
+    /// The curator generated a `proposed/` skill by merging two active
+    /// skills whose bodies overlap moderately. Written verbatim to disk;
+    /// promotion still requires validator pass + human/autopromoter
+    /// approval. `proposal_filename` is the just-written file, ready to
+    /// pass to `validate_skill_proposal` / `approve_proposal`.
+    SkillMergeProposed {
+        proposal_filename: String,
+        merged_name:       String,
+        source_a:          String,
+        source_b:          String,
+        body_similarity:   f64,
+    },
 }
 
 impl ForgeEvent {
@@ -260,6 +290,9 @@ impl ForgeEvent {
 
             SkillValidationPassed { name, .. }
             | SkillValidationFailed { name, .. } => format!("skill_{name}"),
+
+            SkillAutoArchived { archived_name, .. } => format!("skill_{archived_name}"),
+            SkillMergeProposed { merged_name, .. } => format!("skill_{merged_name}"),
         }
     }
 
@@ -306,7 +339,9 @@ impl ForgeEvent {
             | SkillCurationSuggested { .. }
             | SkillValidationPassed { .. }
             | SkillValidationFailed { .. }
-            | SkillAutoPromoted { .. } => AggregateKind::Skill,
+            | SkillAutoPromoted { .. }
+            | SkillAutoArchived { .. }
+            | SkillMergeProposed { .. } => AggregateKind::Skill,
         }
     }
 
@@ -355,6 +390,8 @@ impl ForgeEvent {
             SkillValidationPassed { .. } => "skill_validation_passed",
             SkillValidationFailed { .. } => "skill_validation_failed",
             SkillAutoPromoted { .. } => "skill_auto_promoted",
+            SkillAutoArchived { .. } => "skill_auto_archived",
+            SkillMergeProposed { .. } => "skill_merge_proposed",
         }
     }
 }

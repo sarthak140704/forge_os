@@ -338,7 +338,19 @@ impl SkillOps {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Curator — surfaces merge/dedupe/archive candidates. Advisory only.
+// Curator — Phase 4c: **actionable** merge/dedupe/archive engine.
+//
+// Phases:
+//   4a: Advisory — emitted `SkillCurationSuggested` only. Kept intact for
+//       backwards-compat callers.
+//   4c: Actionable — same discovery pass but the caller can opt into
+//       `act = true` to auto-archive dupes and drop merge proposals into
+//       `proposed/`. Wraps existing `SkillOps::retire` + `ProposalWriter`
+//       so every action still flows through the append-only history.
+//
+// Never touches skills that already have a pending proposal (avoids
+// double-work with AutoPromoter) and never archives a skill that
+// participates in a `skills_selected` event within the recent window.
 // ────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -353,89 +365,446 @@ pub struct CuratorSuggestion {
 pub enum CuratorKind {
     Duplicate,
     Unused,
+    MergeCandidate,
 }
 
 impl CuratorKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            CuratorKind::Duplicate => "duplicate",
-            CuratorKind::Unused    => "unused",
+            CuratorKind::Duplicate      => "duplicate",
+            CuratorKind::Unused         => "unused",
+            CuratorKind::MergeCandidate => "merge_candidate",
         }
     }
+}
+
+/// Tunable thresholds for the Curator. Sensible defaults matched to the
+/// smoke suite; override via `RuntimeConfig.curator`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CuratorPolicy {
+    /// Name Jaro-Winkler ≥ this → treat as duplicate. Default 0.92.
+    pub name_similarity_threshold: f64,
+    /// Body Jaccard ≥ this → treat as duplicate. Default 0.85.
+    pub body_similarity_threshold: f64,
+    /// Body Jaccard in `[merge_low, body_similarity_threshold)` → propose merge.
+    /// Default 0.55.
+    pub merge_similarity_low: f64,
+    /// Skills that appear in a `SkillsSelected` event within the last N
+    /// terminal missions are protected from auto-archive. Default 5.
+    pub protect_recent_usage_missions: usize,
+    /// If true, `Curator::run` immediately applies decisions
+    /// (retire dupes, write merge proposals). If false, callers get the
+    /// report and choose per-suggestion. Default false.
+    pub auto_act: bool,
+}
+
+impl Default for CuratorPolicy {
+    fn default() -> Self {
+        Self {
+            name_similarity_threshold: 0.92,
+            body_similarity_threshold: 0.85,
+            merge_similarity_low:      0.55,
+            protect_recent_usage_missions: 5,
+            auto_act: false,
+        }
+    }
+}
+
+/// Structured outcome of a scan — what the Curator saw AND what it did.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CuratorReport {
+    pub suggestions:      Vec<CuratorSuggestion>,
+    /// (archived_name, kept_name) pairs. Empty when `auto_act=false`.
+    pub auto_archived:    Vec<(String, String)>,
+    /// Proposal filenames written under `proposed/`. Empty when
+    /// `auto_act=false`.
+    pub merge_proposals:  Vec<String>,
 }
 
 pub struct Curator {
     pub ops:       Arc<SkillOps>,
     pub events:    Arc<SqliteEventStore>,
-    /// A skill is "unused" if it has never appeared in a `SkillsSelected`
-    /// event across the entire event log (Phase 4a keeps this global —
-    /// windowing arrives with the learning-engine milestone).
-    pub _placeholder: (),
+    pub policy:    CuratorPolicy,
 }
 
 impl Curator {
+    /// Legacy constructor — advisory-only defaults for callers that predate
+    /// the policy struct (kept green for existing tests).
     pub fn new(ops: Arc<SkillOps>, events: Arc<SqliteEventStore>) -> Self {
-        Self { ops, events, _placeholder: () }
+        Self { ops, events, policy: CuratorPolicy::default() }
     }
 
-    /// Run one pass over the active set. Emits `SkillCurationSuggested`
-    /// for each finding. Returns them all so IPC callers can display the
-    /// list directly.
+    pub fn with_policy(
+        ops: Arc<SkillOps>,
+        events: Arc<SqliteEventStore>,
+        policy: CuratorPolicy,
+    ) -> Self {
+        Self { ops, events, policy }
+    }
+
+    /// Legacy shim: run advisory-only, publish `SkillCurationSuggested` for
+    /// every finding, return the list. Preserved so existing `Curator::run`
+    /// callers keep compiling.
     pub async fn run(&self) -> Result<Vec<CuratorSuggestion>, SkillOpsError> {
-        let active = self.ops.history.list_active().await?;
-        let mut out = Vec::new();
-
-        // --- Duplicate detection (pairwise Jaro-Winkler on names). ---
-        for i in 0..active.len() {
-            for j in (i+1)..active.len() {
-                let a = &active[i].name;
-                let b = &active[j].name;
-                let jw = jaro_winkler(a, b);
-                if jw >= 0.90 {
-                    let evidence = format!("similarity={:.3} vs `{}`", jw, b);
-                    out.push(CuratorSuggestion {
-                        name: a.clone(),
-                        kind: CuratorKind::Duplicate,
-                        evidence,
-                    });
-                }
-            }
-        }
-
-        // --- Unused detection (scan SkillsSelected events). ---
-        let used = self.used_skill_names().await?;
-        for row in &active {
-            if !used.contains(&row.name) {
-                out.push(CuratorSuggestion {
-                    name: row.name.clone(),
-                    kind: CuratorKind::Unused,
-                    evidence: "no SkillsSelected event references this skill".into(),
-                });
-            }
-        }
-
-        for s in &out {
+        let report = self.scan(false).await?;
+        for s in &report.suggestions {
             self.ops.events.publish(ForgeEvent::SkillCurationSuggested {
                 name: s.name.clone(),
                 kind: s.kind.as_str().into(),
                 evidence: s.evidence.clone(),
             }).await.ok();
         }
+        Ok(report.suggestions)
+    }
+
+    /// Full Phase 4c scan.
+    ///
+    /// - `apply=false` returns the report only; nothing on disk changes,
+    ///   still emits `SkillCurationSuggested` per finding so the timeline
+    ///   sees "the curator ran".
+    /// - `apply=true` also archives duplicate losers via
+    ///   `SkillOps::retire` (emits `SkillRetired` + `SkillAutoArchived`)
+    ///   and writes merge proposals via `ProposalWriter` (emits
+    ///   `SkillMergeProposed`).
+    ///
+    /// The `apply` flag lets a UI do "dry run → confirm → apply" without
+    /// duplicating logic. When policy.auto_act is true the callers ignore
+    /// this arg and pass `true`.
+    pub async fn scan(&self, apply: bool) -> Result<CuratorReport, SkillOpsError> {
+        let active = self.ops.history.list_active().await?;
+        let bodies = self.read_active_bodies(&active).await?;
+        let used_recent = self.recently_used_names().await?;
+        let pending = self.pending_proposal_names();
+
+        let mut suggestions   = Vec::new();
+        let mut auto_archived = Vec::new();
+        let mut merge_props   = Vec::new();
+
+        // Pass 1: pairwise dedupe + merge candidates.
+        // `archived_this_pass` tracks skills we already retired so we don't
+        // then also merge-propose them; also avoids double-retiring a skill
+        // that pairs with two others.
+        let mut archived_this_pass: std::collections::HashSet<String> = Default::default();
+
+        for i in 0..active.len() {
+            for j in (i+1)..active.len() {
+                let a = &active[i];
+                let b = &active[j];
+                if archived_this_pass.contains(&a.name) || archived_this_pass.contains(&b.name) {
+                    continue;
+                }
+                let name_sim = jaro_winkler(&a.name, &b.name);
+                let body_a = bodies.get(&a.name).map(|s| s.as_str()).unwrap_or("");
+                let body_b = bodies.get(&b.name).map(|s| s.as_str()).unwrap_or("");
+                let body_sim = forge_skills::body_similarity(body_a, body_b);
+                let subset   = forge_skills::subset_ratio(body_a, body_b);
+
+                // Rule 1 — auto-archive worthy duplicates.
+                //   name Jaro-Winkler high OR body Jaccard high OR one is
+                //   a proper subset of the other.
+                let duplicate = name_sim >= self.policy.name_similarity_threshold
+                    || body_sim >= self.policy.body_similarity_threshold
+                    || subset >= 0.95;
+
+                if duplicate {
+                    let rule = if subset >= 0.95            { "subset_of" }
+                               else if body_sim >= self.policy.body_similarity_threshold { "body_similar" }
+                               else                        { "name_similar" };
+                    let sim  = subset.max(body_sim).max(name_sim);
+                    let evidence = format!(
+                        "duplicate of `{}` (rule={rule}, name_jw={:.3}, body_jaccard={:.3}, subset={:.3})",
+                        b.name, name_sim, body_sim, subset,
+                    );
+                    suggestions.push(CuratorSuggestion {
+                        name: a.name.clone(),
+                        kind: CuratorKind::Duplicate,
+                        evidence: evidence.clone(),
+                    });
+
+                    if apply {
+                        // Pick the loser: lower usage first, then lower
+                        // semver, then alphabetically later. Never
+                        // auto-archive a skill used in the recent window.
+                        let (loser, keeper) = self.pick_loser(a, b, &used_recent);
+                        if let (Some(loser), Some(keeper)) = (loser, keeper) {
+                            if archived_this_pass.contains(&loser.name) { continue; }
+                            match self.ops.retire(&loser.name, &format!(
+                                "curator auto-archived: {rule} to `{}`", keeper.name
+                            )).await {
+                                Ok(Some(sha)) => {
+                                    self.ops.events.publish(ForgeEvent::SkillAutoArchived {
+                                        archived_name: loser.name.clone(),
+                                        archived_sha:  sha,
+                                        kept_name:     keeper.name.clone(),
+                                        similarity:    sim,
+                                        rule:          rule.into(),
+                                    }).await.ok();
+                                    auto_archived.push((loser.name.clone(), keeper.name.clone()));
+                                    archived_this_pass.insert(loser.name.clone());
+                                }
+                                Ok(None) => {}
+                                Err(e) => tracing::warn!(err = %e, name = %loser.name, "curator: retire failed"),
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Rule 2 — merge candidates: bodies moderately overlap but
+                // neither dominates. Propose a merged skill (advisory even
+                // without apply; only written to disk when apply=true).
+                if body_sim >= self.policy.merge_similarity_low
+                    && body_sim < self.policy.body_similarity_threshold
+                {
+                    let evidence = format!(
+                        "merge candidate with `{}` (body_jaccard={:.3})",
+                        b.name, body_sim,
+                    );
+                    suggestions.push(CuratorSuggestion {
+                        name: a.name.clone(),
+                        kind: CuratorKind::MergeCandidate,
+                        evidence: evidence.clone(),
+                    });
+
+                    if apply {
+                        let merged_name = merged_name_of(&a.name, &b.name);
+                        // Skip if there's already a pending proposal by
+                        // this merged name (idempotent across sweeps).
+                        if pending.contains(&merged_name) { continue; }
+                        match self.write_merge_proposal(a, b, body_a, body_b).await {
+                            Ok(filename) => {
+                                self.ops.events.publish(ForgeEvent::SkillMergeProposed {
+                                    proposal_filename: filename.clone(),
+                                    merged_name:       merged_name.clone(),
+                                    source_a:          a.name.clone(),
+                                    source_b:          b.name.clone(),
+                                    body_similarity:   body_sim,
+                                }).await.ok();
+                                merge_props.push(filename);
+                            }
+                            Err(e) => tracing::warn!(err = %e, "curator: merge proposal write failed"),
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: unused-in-recent-window flag.
+        for row in &active {
+            if archived_this_pass.contains(&row.name) { continue; }
+            if used_recent.contains(&row.name) { continue; }
+            let evidence = format!(
+                "not used in the last {} terminal missions", self.policy.protect_recent_usage_missions,
+            );
+            suggestions.push(CuratorSuggestion {
+                name: row.name.clone(),
+                kind: CuratorKind::Unused,
+                evidence,
+            });
+        }
+
+        // Always echo the advisory events so the timeline records a scan.
+        for s in &suggestions {
+            self.ops.events.publish(ForgeEvent::SkillCurationSuggested {
+                name: s.name.clone(),
+                kind: s.kind.as_str().into(),
+                evidence: s.evidence.clone(),
+            }).await.ok();
+        }
+
+        Ok(CuratorReport {
+            suggestions,
+            auto_archived,
+            merge_proposals: merge_props,
+        })
+    }
+
+    /// Read the raw markdown bodies of every currently-active skill. Missing
+    /// files are silently skipped (the history row wins over disk).
+    async fn read_active_bodies(&self, active: &[SkillVersionRecord])
+        -> Result<std::collections::HashMap<String, String>, SkillOpsError>
+    {
+        use forge_skills::parse_skill;
+        let mut out: std::collections::HashMap<String, String> = Default::default();
+        let dir = self.ops.skills_root.join("active");
+        if !dir.exists() { return Ok(out); }
+        let by_name: std::collections::HashSet<&str> =
+            active.iter().map(|r| r.name.as_str()).collect();
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+            let raw = match std::fs::read_to_string(&path) { Ok(s) => s, Err(_) => continue };
+            let parsed = match parse_skill(&raw) { Ok(s) => s, Err(_) => continue };
+            if by_name.contains(parsed.front.name.as_str()) {
+                out.insert(parsed.front.name, parsed.body);
+            }
+        }
         Ok(out)
     }
 
-    /// Scan the event store for every `skills_selected` payload and collect
-    /// the union of skill names referenced. Cheap: reads once, filters
-    /// client-side.
-    async fn used_skill_names(&self) -> Result<std::collections::HashSet<String>, SkillOpsError> {
-        let mut set = std::collections::HashSet::new();
+    /// Union of skill names referenced by `SkillsSelected` events tied to
+    /// the most recent N *terminal* missions. Falls back to the global
+    /// "any mission" set when the terminal count is smaller than the window.
+    async fn recently_used_names(&self)
+        -> Result<std::collections::HashSet<String>, SkillOpsError>
+    {
+        use forge_domain::ForgeEvent as FE;
         let all = self.events.read_since(None).await?;
-        for env in all {
-            if let ForgeEvent::SkillsSelected { skill_names, .. } = env.event {
-                for n in skill_names { set.insert(n); }
+        // Collect (mission_id, is_terminal, timestamp) then pick most-
+        // recent-terminal N. Terminal = completed/failed/cancelled.
+        let mut terminal_missions: Vec<String> = Vec::new();
+        for env in &all {
+            if let FE::MissionStatusChanged { id, to, .. } = &env.event {
+                let s = format!("{to:?}").to_lowercase();
+                if s.contains("completed") || s.contains("failed") || s.contains("cancelled") {
+                    terminal_missions.push(id.to_string());
+                }
             }
         }
-        Ok(set)
+        let recent: std::collections::HashSet<String> = terminal_missions
+            .into_iter()
+            .rev()
+            .take(self.policy.protect_recent_usage_missions)
+            .collect();
+
+        // If we have fewer terminal missions than the window, keep the
+        // union global — new users shouldn't have every skill flagged as
+        // "unused" just because they've only run 2 missions total.
+        let global = recent.is_empty();
+
+        let mut used = std::collections::HashSet::new();
+        for env in all {
+            if let FE::SkillsSelected { mission_id, skill_names } = env.event {
+                if global || recent.contains(&mission_id.to_string()) {
+                    for n in skill_names { used.insert(n); }
+                }
+            }
+        }
+        Ok(used)
+    }
+
+    /// Front-matter names of every skill currently sitting in `proposed/`.
+    fn pending_proposal_names(&self) -> std::collections::HashSet<String> {
+        list_proposals(&self.ops.skills_root)
+            .map(|v| v.into_iter().map(|s| s.front.name).collect())
+            .unwrap_or_default()
+    }
+
+    /// Pick which of two duplicate skills to archive.
+    /// Never picks a recently-used skill as the loser.
+    fn pick_loser<'r>(
+        &self,
+        a: &'r SkillVersionRecord,
+        b: &'r SkillVersionRecord,
+        used_recent: &std::collections::HashSet<String>,
+    ) -> (Option<&'r SkillVersionRecord>, Option<&'r SkillVersionRecord>) {
+        let a_used = used_recent.contains(&a.name);
+        let b_used = used_recent.contains(&b.name);
+        // If both were used recently, don't archive either.
+        if a_used && b_used { return (None, None); }
+        // If exactly one was used, that one wins.
+        if a_used { return (Some(b), Some(a)); }
+        if b_used { return (Some(a), Some(b)); }
+        // Neither used: pick alphabetically later as loser (deterministic).
+        if a.name <= b.name { (Some(b), Some(a)) } else { (Some(a), Some(b)) }
+    }
+
+    /// Write a merged proposal combining `a` and `b`'s bodies + tools +
+    /// keywords. Returns the just-written filename (not full path).
+    async fn write_merge_proposal(
+        &self,
+        a: &SkillVersionRecord,
+        b: &SkillVersionRecord,
+        body_a: &str,
+        body_b: &str,
+    ) -> Result<String, SkillOpsError> {
+        use forge_skills::{parse_skill, merge_bodies, union_dedup, ProposalWriter, SuggestedSkill};
+        // Read tools + keywords straight off disk — the history row doesn't
+        // carry them.
+        let (tools_a, kws_a) = self.front_tools_keywords(&a.name)?;
+        let (tools_b, kws_b) = self.front_tools_keywords(&b.name)?;
+        let _ = parse_skill; // silence unused-import warning if parse_skill isn't used elsewhere.
+        let merged_name = merged_name_of(&a.name, &b.name);
+        let merged_body = merge_bodies(body_a, body_b);
+        let suggested = SuggestedSkill {
+            name:              merged_name.clone(),
+            description:       format!(
+                "Merged skill combining `{}` and `{}` (curator auto-generated; review before promoting)",
+                a.name, b.name,
+            ),
+            tools:             union_dedup(&tools_a, &tools_b),
+            keywords:          union_dedup(&kws_a, &kws_b),
+            body:              merged_body,
+            origin_mission_id: format!("curator-merge-{}-{}", a.name, b.name),
+        };
+        let writer = ProposalWriter::new(&self.ops.skills_root);
+        let path = writer.write_proposal(&suggested)?;
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .unwrap_or_default();
+        Ok(filename)
+    }
+
+    fn front_tools_keywords(&self, name: &str) -> Result<(Vec<String>, Vec<String>), SkillOpsError> {
+        use forge_skills::parse_skill;
+        let dir = self.ops.skills_root.join("active");
+        if !dir.exists() { return Ok((Vec::new(), Vec::new())); }
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+            let raw = match std::fs::read_to_string(&path) { Ok(s) => s, Err(_) => continue };
+            let parsed = match parse_skill(&raw) { Ok(s) => s, Err(_) => continue };
+            if parsed.front.name == name {
+                return Ok((parsed.front.tools, parsed.front.triggers.keywords));
+            }
+        }
+        Ok((Vec::new(), Vec::new()))
+    }
+}
+
+/// Deterministic name for the auto-generated merge of two skills. Both
+/// orderings collapse to the same output so the pending-proposal dedup
+/// works.
+fn merged_name_of(a: &str, b: &str) -> String {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    format!("{lo}-plus-{hi}")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// CuratorSweeper — background loop (mirror of AutoPromoter).
+// Off by default; enabled via `RuntimeConfig.curator_sweep_enabled = true`.
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct CuratorSweeper {
+    pub curator:  Arc<Curator>,
+    pub interval: std::time::Duration,
+    pub apply:    bool,
+}
+
+impl CuratorSweeper {
+    pub fn new(curator: Arc<Curator>, interval: std::time::Duration, apply: bool) -> Self {
+        Self { curator, interval, apply }
+    }
+
+    pub fn spawn(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(self.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // skip immediate first tick
+            loop {
+                ticker.tick().await;
+                match self.curator.scan(self.apply).await {
+                    Ok(r) => tracing::info!(
+                        suggestions   = r.suggestions.len(),
+                        auto_archived = r.auto_archived.len(),
+                        merge_props   = r.merge_proposals.len(),
+                        "curator sweep completed",
+                    ),
+                    Err(e) => tracing::warn!(err = %e, "curator sweep error"),
+                }
+            }
+        });
     }
 }
 

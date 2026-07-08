@@ -140,8 +140,14 @@ export interface SkillVersion {
 
 export interface CuratorSuggestion {
   name: string;
-  kind: "duplicate" | "unused";
+  kind: "duplicate" | "unused" | "merge_candidate";
   evidence: string;
+}
+
+export interface CuratorReport {
+  suggestions: CuratorSuggestion[];
+  auto_archived: Array<[string, string]>;
+  merge_proposals: string[];
 }
 
 export interface ValidationCheck {
@@ -183,4 +189,8 @@ export async function retireSkill(name: string, reason: string): Promise<string 
 }
 export async function runCurator(): Promise<CuratorSuggestion[]> {
   return invoke<CuratorSuggestion[]>("run_curator");
+}
+
+export async function curatorScan(apply: boolean): Promise<CuratorReport> {
+  return invoke<CuratorReport>("curator_scan", { apply });
 }

@@ -305,6 +305,79 @@ Three new variants, all `AggregateKind::Skill`:
 ---
 
 
+## Phase 4c — Actionable Skill Curator (SHIPPED)
+
+**Motivation (agent.txt):** *"Learning without curation drifts."* Phase 4c elevates the previously-advisory Curator to an actionable one: it auto-archives near-duplicates, drops merge proposals into `proposed/` (validator-gated), and still surfaces "unused" advisory rows — with a recent-usage protection window so freshly-added skills aren't flagged after two missions.
+
+### Similarity math — `crates/forge-skills/src/similarity.rs` (NEW)
+
+Pure functions, no I/O, no runtime deps. 9 unit tests cover identical / disjoint / paraphrase / subset / merge.
+
+- `tokenize(s)` — lowercase, split on non-alphanumeric, keep tokens with `len ≥ 3`.
+- `shingles(tokens, 3)` — 3-gram shingles with fallback to individual tokens for very short bodies.
+- `jaccard(a, b)` — set Jaccard on shingles. `jaccard(∅, ∅) = 1.0`; `jaccard(∅, x) = 0.0`.
+- `body_similarity(a, b)` — Jaccard on token-3-grams of the two bodies.
+- `subset_ratio(a, b)` — fraction of the *smaller* body's shingles present in the larger. Detects containment when Jaccard understates it.
+- `merge_bodies(a, b)` — keeps longer verbatim, appends paragraphs from shorter not already substring-present, with a `<!-- merged: ... -->` marker.
+- `union_dedup([...])` — order-preserving dedup.
+
+### Curator — `crates/forge-runtime/src/skills_ops.rs` (rewritten)
+
+- **`CuratorPolicy`** (`#[serde(default)]`):
+  - `name_similarity_threshold = 0.92`
+  - `body_similarity_threshold = 0.85`
+  - `subset_ratio_threshold = 0.95`
+  - `merge_similarity_low = 0.35`
+  - `recent_mission_window = 20`
+- **`CuratorReport { suggestions, auto_archived, merge_proposals }`** — actions taken are always separate from suggestions so UIs can render "we found N *and* did K".
+- **`Curator::with_policy(pool, root, events, policy)`** + **`scan(apply: bool) -> CuratorReport`**. Legacy `Curator::new` + `run()` preserved for backwards compat.
+- **Auto-archive rules** (any triggers): `name_sim ≥ threshold` OR `body_sim ≥ threshold` OR `subset_ratio ≥ threshold`.
+- **Merge band**: `body_sim ∈ [merge_low, body_threshold)` — writes a merged file to `proposed/` with a computed `merged_name_of(a, b)` (sorted so orderings collapse); publishes `SkillMergeProposed`.
+- **Deterministic loser pick** (`pick_loser`): if either skill was in the last N terminal missions, protect it; otherwise the alphabetically-later name loses. Prevents non-determinism across runs.
+- **Recent-usage window** (`recently_used_names`): picks the most-recent N *terminal* missions (from `MissionStatusChanged` where `to ∈ completed|failed|cancelled`), collects `SkillsSelected` names. **Fallback:** if fewer terminal missions exist than N, treat ALL missions as "recent" — prevents new users from having every skill flagged as unused after 2 runs.
+- **Idempotency** (`pending_proposal_names`): scans `proposed/` and skips merge proposals whose `merged_name` already exists there. Second scan is a no-op.
+
+### CuratorSweeper — bottom of `skills_ops.rs`
+
+Mirrors `AutoPromoter`. Background tokio loop with `MissedTickBehavior::Delay`. Off by default via `RuntimeConfig.curator_sweep_enabled = false`; interval clamped to `max(60, curator_interval_secs)`.
+
+### Events (`crates/forge-domain/src/event.rs`)
+
+Two new variants, both `AggregateKind::Skill`:
+- `SkillAutoArchived { name, reason, similarity, kept }` — emitted when Curator moves a duplicate to `archived/`.
+- `SkillMergeProposed { filename, merged_name, sources, similarity }` — emitted when a merge proposal file lands in `proposed/`. Validator (Phase 4b) then gates promotion.
+
+### LLM error surfacing — `crates/forge-llm/src/lib.rs`
+
+Independent fix that landed alongside Phase 4c: `LlmChain::complete()` now aggregates *every* provider's error into `LlmError::AllFailed("[groq] <msg> | [ollama] <msg>")` instead of only the last one. Root-caused after a Groq TPD-exhaustion cascade was hidden behind an Ollama connection error.
+
+### Runtime + IPC
+
+- **`RuntimeConfig`**: `curator: CuratorPolicy` (default), `curator_sweep_enabled: bool` (default false), `curator_interval_secs: u64` (default 900). Boot swaps `Curator::new` → `Curator::with_policy` and spawns `CuratorSweeper` when enabled.
+- **New IPC command `curator_scan(apply: bool) -> CuratorReport`** in `apps/forge-desktop/src-tauri/src/lib.rs`. Registered in `invoke_handler`.
+
+### Frontend — Settings > Skills
+
+`SkillsSection` in `views/Settings.tsx` upgraded with three buttons:
+- **Advisory scan** — `curator_scan(false)` filtered to suggestions only.
+- **Dry-run scan** — `curator_scan(false)` — full report incl. would-be archive/merge classifications.
+- **Scan & apply** — `curator_scan(true)` — auto-archives + writes merge proposals. Renders an actions-taken panel: archived skills + merge-proposal filenames.
+
+Types + IPC binding added in `lib/ipc.ts` (`CuratorReport`, `curatorScan`). Event union + `event-filter.ts` + `EventTimeline.tsx` summarize cases added for the two new events.
+
+### Verify
+
+```powershell
+cargo test -p forge-skills --lib similarity                # 9/9 pass
+cargo run -p forge-runtime --example skill_curator_smoke   # 3/3 scenarios pass
+cargo test --workspace                                     # existing baseline preserved (except pre-existing user_memory env-var race in --test-threads>=2)
+```
+
+The smoke covers dry-run classification, apply (dedupe + merge + validator OK), and idempotent 2nd pass (0 new proposals).
+
+---
+
+
 ## Frontend surface
 
 **Stores** (`apps/forge-desktop/frontend/src/stores/`)

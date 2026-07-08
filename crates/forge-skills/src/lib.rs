@@ -31,6 +31,7 @@ pub mod format;
 pub mod loader;
 pub mod registry;
 pub mod proposal;
+pub mod similarity;
 pub mod validate;
 pub mod versions;
 
@@ -43,6 +44,9 @@ pub use proposal::{
     restore_from_bytes, retire_active_skill, ProposalWriter, SuggestedSkill,
 };
 pub use registry::{SkillMatch, SkillRegistry};
+pub use similarity::{
+    body_similarity, jaccard, merge_bodies, shingles, subset_ratio, tokenize, union_dedup,
+};
 pub use validate::{
     validate_bytes, validate_file, validate_skill,
     ActiveSkillSummary, Severity, ValidationCheck, ValidationReport, ValidatorContext,
