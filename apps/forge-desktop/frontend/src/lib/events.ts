@@ -102,7 +102,10 @@ export type ForgeEvent =
   | { type: "skill_promoted"; name: string; sha: string; version: string; origin: string; parent_sha?: string | null; origin_mission_id?: string | null }
   | { type: "skill_rolled_back"; name: string; from_sha?: string | null; to_sha: string; reason?: string | null }
   | { type: "skill_retired"; name: string; sha: string; reason: string }
-  | { type: "skill_curation_suggested"; name: string; kind: string; evidence: string };
+  | { type: "skill_curation_suggested"; name: string; kind: string; evidence: string }
+  | { type: "skill_validation_passed"; filename: string; name: string; soft_failures: string[] }
+  | { type: "skill_validation_failed"; filename: string; name: string; failed_checks: string[] }
+  | { type: "skill_auto_promoted"; name: string; sha: string; version: string };
 
 export interface EventEnvelope {
   seq: number;

@@ -46,6 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_parallel_goals: 2,
         skills_root: Some(skills_root.clone()),
         mcp_config:  Some(tmp.join("mcp.yaml")),
+        auto_promote_skills: false,
+        autopromote_interval_secs: 300,
     };
     let runtime = Runtime::boot(config).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -60,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         description: "first version".into(),
         tools: vec!["fs.read".into()],
         keywords: vec!["smoke".into()],
-        body: "# smoke-skill v1\n\nfirst body\n".into(),
+        body: "# smoke-skill v1\n\nThis is the first version of the smoke skill used for versioning tests. It exercises promotion, rollback, and history behaviour end to end.\n".into(),
         origin_mission_id: "".into(),
     })?;
     // Guarantee a distinct filename by advancing filesystem timestamps.
@@ -70,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         description: "second version".into(),
         tools: vec!["fs.read".into(), "fs.write".into()],
         keywords: vec!["smoke".into()],
-        body: "# smoke-skill v2\n\nsecond body\n".into(),
+        body: "# smoke-skill v2\n\nSecond version of the same skill, adds an extra tool and rewrites the body so version monotonicity and rollback can be validated.\n".into(),
         origin_mission_id: "".into(),
     })?;
     // Also write a proposal for a name close enough to trigger the curator
@@ -78,9 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p3 = writer.write_proposal(&SuggestedSkill {
         name: "smoke-skil".into(), // one char off
         description: "near-duplicate".into(),
-        tools: vec![],
-        keywords: vec![],
-        body: "# near-dup\n\nbody\n".into(),
+        tools: vec!["fs.read".into()],
+        keywords: vec!["smoke".into()],
+        body: "# near-dup\n\nA near-duplicate proposal used to exercise the curator name-similarity heuristic without being an outright collision.\n".into(),
         origin_mission_id: "".into(),
     })?;
 
@@ -211,9 +213,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p4 = writer.write_proposal(&SuggestedSkill {
         name: "smoke-skiler".into(),
         description: "another near-dup".into(),
-        tools: vec![],
-        keywords: vec![],
-        body: "# skiler\n\nbody\n".into(),
+        tools: vec!["fs.read".into()],
+        keywords: vec!["smoke".into()],
+        body: "# skiler\n\nAnother near-duplicate skill used to give the curator a second promoted skill to compare names against during suggestion runs.\n".into(),
         origin_mission_id: "".into(),
     })?;
     let file4 = p4.file_name().unwrap().to_string_lossy().to_string();

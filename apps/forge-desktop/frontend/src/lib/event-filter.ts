@@ -76,6 +76,9 @@ export function eventMissionId(
     case "skill_rolled_back":
     case "skill_retired":
     case "skill_curation_suggested":
+    case "skill_validation_passed":
+    case "skill_validation_failed":
+    case "skill_auto_promoted":
       return null;
     default:
       return null;

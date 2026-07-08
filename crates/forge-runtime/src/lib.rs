@@ -180,8 +180,18 @@ pub struct RuntimeConfig {
     /// Missing file is fine — MCP is opt-in.
     #[serde(default)]
     pub mcp_config: Option<PathBuf>,
+    /// Phase 4b: if `true`, spawn a background loop that automatically
+    /// promotes any proposal passing the validator. Off by default — human
+    /// review is the norm and autopromotion is opt-in via config.
+    #[serde(default)]
+    pub auto_promote_skills: bool,
+    /// Interval between autopromoter sweeps. Ignored when
+    /// `auto_promote_skills` is false. Defaults to 5 minutes.
+    #[serde(default = "default_autopromote_interval_secs")]
+    pub autopromote_interval_secs: u64,
 }
 fn default_max_parallel() -> usize { 4 }
+fn default_autopromote_interval_secs() -> u64 { 300 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LlmConfig {
@@ -573,7 +583,11 @@ impl Runtime {
         let (skill_ops, curator) = if let Some(root) = config.skills_root.clone() {
             let hist_repo: Arc<dyn forge_persistence::SkillHistoryRepository> =
                 Arc::new(forge_persistence::SqliteSkillHistoryRepository::new(pool.clone()));
-            let ops = Arc::new(skills_ops::SkillOps::new(root, hist_repo, events.clone()));
+            // Seed the validator's tool whitelist from the live registry +
+            // whichever MCP-adapted tools were loaded above. This is what
+            // enforces the `tools_resolvable` hard check on new proposals.
+            let known_tools: Vec<String> = tools.names();
+            let ops = Arc::new(skills_ops::SkillOps::with_tools(root, hist_repo, events.clone(), known_tools));
             // Best-effort seed on boot so hand-authored SKILL.md files show
             // up in the history table.  Failures logged, not fatal.
             match ops.seed_missing_history().await {
@@ -585,6 +599,18 @@ impl Runtime {
             // not the bus). Cheap Arc clone.
             let curator_events = Arc::new(SqliteEventStore::new(pool.clone()));
             let curator = Arc::new(skills_ops::Curator::new(ops.clone(), curator_events));
+
+            // Phase 4b: optional autopromoter background loop.
+            if config.auto_promote_skills {
+                let interval = std::time::Duration::from_secs(config.autopromote_interval_secs.max(30));
+                let promoter = Arc::new(skills_ops::AutoPromoter::new(ops.clone(), interval));
+                tracing::info!(
+                    interval_s = interval.as_secs(),
+                    "autopromoter enabled — proposals passing validation will be promoted without approval"
+                );
+                promoter.spawn();
+            }
+
             (Some(ops), Some(curator))
         } else {
             (None, None)

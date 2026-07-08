@@ -65,7 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         max_parallel_goals: 2,
         skills_root: Some(tmp.join("skills")),
-        mcp_config: Some(tmp.join("mcp.yaml")), // missing file → skipped
+        mcp_config:  Some(tmp.join("mcp.yaml")),
+        auto_promote_skills: false,
+        autopromote_interval_secs: 300, // missing file → skipped
     };
 
     let runtime = Runtime::boot(config).await?;

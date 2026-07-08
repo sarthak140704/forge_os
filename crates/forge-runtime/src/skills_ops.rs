@@ -31,7 +31,8 @@ use forge_persistence::{
 };
 use forge_skills::{
     approve_proposal_detail, list_proposals, restore_from_bytes, retire_active_skill,
-    parse_skill, SkillVersionStore,
+    parse_skill, validate_bytes, ActiveSkillSummary, SkillVersionStore, ValidationReport,
+    ValidatorContext,
 };
 use std::str::FromStr;
 use thiserror::Error;
@@ -50,6 +51,8 @@ pub enum SkillOpsError {
     ShaMissing(String, String),
     #[error("proposal `{0}` not found")]
     ProposalMissing(String),
+    #[error("proposal `{filename}` failed validation: {failed:?}")]
+    ValidationFailed { filename: String, failed: Vec<String> },
 }
 
 pub struct SkillOps {
@@ -57,6 +60,9 @@ pub struct SkillOps {
     pub history:     Arc<dyn SkillHistoryRepository>,
     pub store:       SkillVersionStore,
     pub events:      EventBus,
+    /// Tool ids known to the local runtime — consulted by the validator's
+    /// `tools_resolvable` check. Empty in test / headless contexts.
+    pub known_tools: Vec<String>,
 }
 
 impl SkillOps {
@@ -65,16 +71,74 @@ impl SkillOps {
         history: Arc<dyn SkillHistoryRepository>,
         events: EventBus,
     ) -> Self {
+        Self::with_tools(skills_root, history, events, Vec::new())
+    }
+
+    /// Same as `new`, but seeds the tool-name whitelist so the validator can
+    /// hard-reject proposals that reference tools the runtime doesn't have.
+    pub fn with_tools(
+        skills_root: impl Into<PathBuf>,
+        history: Arc<dyn SkillHistoryRepository>,
+        events: EventBus,
+        known_tools: Vec<String>,
+    ) -> Self {
         let root = skills_root.into();
         let store = SkillVersionStore::new(&root);
-        Self { skills_root: root, history, store, events }
+        Self { skills_root: root, history, store, events, known_tools }
+    }
+
+    /// Snapshot the currently-active skills into the shape the validator
+    /// expects. Cheap: one DB call.
+    async fn active_summaries(&self) -> Result<Vec<ActiveSkillSummary>, SkillOpsError> {
+        let rows = self.history.list_active().await?;
+        // We only need keywords for the collision check. Re-read the
+        // matching file to get them — expensive-looking but bounded by the
+        // number of active skills (< 50 in practice).
+        let mut out = Vec::with_capacity(rows.len());
+        let active_dir = self.skills_root.join("active");
+        for r in rows {
+            let mut kws = Vec::new();
+            if active_dir.exists() {
+                for entry in std::fs::read_dir(&active_dir).ok().into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+                    let raw = match std::fs::read_to_string(&path) { Ok(s) => s, Err(_) => continue };
+                    let parsed = match parse_skill(&raw) { Ok(s) => s, Err(_) => continue };
+                    if parsed.front.name == r.name {
+                        kws = parsed.front.triggers.keywords;
+                        break;
+                    }
+                }
+            }
+            out.push(ActiveSkillSummary { name: r.name, version: r.version, keywords: kws });
+        }
+        Ok(out)
+    }
+
+    /// Run the validator against a proposal file WITHOUT promoting anything.
+    /// Returns the full report so IPC callers can render per-check badges.
+    pub async fn validate_proposal(&self, proposal_filename: &str) -> Result<ValidationReport, SkillOpsError> {
+        let src = self.skills_root.join("proposed").join(proposal_filename);
+        if !src.exists() {
+            return Err(SkillOpsError::ProposalMissing(proposal_filename.into()));
+        }
+        let raw = std::fs::read_to_string(&src)?;
+        let ctx = ValidatorContext {
+            known_tools:   self.known_tools.clone(),
+            active_skills: self.active_summaries().await?,
+        };
+        Ok(validate_bytes(&raw, &ctx))
     }
 
     /// Promote a proposal in `<skills_root>/proposed/<filename>` to active:
-    ///   1. Move the file to `active/`, flipping status to `active`.
-    ///   2. Snapshot the bytes into the content store.
-    ///   3. Append a `SkillPromoted` row (parent_sha = previous active sha).
-    ///   4. Publish `ForgeEvent::SkillPromoted`.
+    ///   0. Run the validator; if any HARD check fails, publish
+    ///      `SkillValidationFailed` and return `ValidationFailed` (the
+    ///      proposal file is left in `proposed/` untouched).
+    ///   1. Publish `SkillValidationPassed` with any soft warnings.
+    ///   2. Move the file to `active/`, flipping status to `active`.
+    ///   3. Snapshot the bytes into the content store.
+    ///   4. Append a `SkillPromoted` row (parent_sha = previous active sha).
+    ///   5. Publish `ForgeEvent::SkillPromoted`.
     ///
     /// If the proposal declares an already-active skill (same name), the
     /// old active row is retired first and its sha is used as `parent_sha`
@@ -88,6 +152,38 @@ impl SkillOps {
         if !src.exists() {
             return Err(SkillOpsError::ProposalMissing(proposal_filename.into()));
         }
+
+        // --- Validation gate (agent.txt: "validation before promotion"). ---
+        let report = self.validate_proposal(proposal_filename).await?;
+        // Parse the proposal ONCE to get the declared name for the events.
+        // The validator already parsed; we re-parse here to grab the name
+        // rather than pass it through the report (keeps validator generic).
+        let raw = std::fs::read_to_string(&src)?;
+        let parsed_name = parse_skill(&raw).map(|s| s.front.name).unwrap_or_else(|_| "<unparsed>".into());
+        if !report.ok {
+            let failed = report.hard_failures();
+            self.events.publish(ForgeEvent::SkillValidationFailed {
+                filename: proposal_filename.into(),
+                name:     parsed_name.clone(),
+                failed_checks: failed.clone(),
+            }).await.ok();
+            return Err(SkillOpsError::ValidationFailed {
+                filename: proposal_filename.into(),
+                failed,
+            });
+        }
+        // Soft failures don't block, but we publish them so the audit log
+        // shows which warnings were tolerated at promotion time.
+        let soft_failures: Vec<String> = report.checks.iter()
+            .filter(|c| !c.passed && c.severity == forge_skills::Severity::Soft)
+            .map(|c| c.id.clone())
+            .collect();
+        self.events.publish(ForgeEvent::SkillValidationPassed {
+            filename: proposal_filename.into(),
+            name:     parsed_name.clone(),
+            soft_failures,
+        }).await.ok();
+
         // Approve moves the file to active/ and hands us the bytes' sha +
         // the parsed name/version — computed off the FINAL (status=active)
         // document so the sha is stable across future reads.
@@ -340,6 +436,81 @@ impl Curator {
             }
         }
         Ok(set)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// AutoPromoter — background loop that promotes validation-passing proposals
+// without human intervention. Off by default; enabled via
+// `RuntimeConfig.auto_promote_skills = true`.
+// ────────────────────────────────────────────────────────────────────────────
+
+pub struct AutoPromoter {
+    pub ops:      Arc<SkillOps>,
+    pub interval: std::time::Duration,
+}
+
+impl AutoPromoter {
+    pub fn new(ops: Arc<SkillOps>, interval: std::time::Duration) -> Self {
+        Self { ops, interval }
+    }
+
+    /// Run one sweep: enumerate every `.md` in `proposed/`, validate each,
+    /// promote those whose report is `ok`. Returns the count promoted.
+    ///
+    /// Failures during promotion (e.g. IO error) are logged and skipped —
+    /// the loop must be resilient because it runs unattended.
+    pub async fn sweep(&self) -> Result<usize, SkillOpsError> {
+        let proposals = list_proposals(&self.ops.skills_root)?;
+        let mut promoted = 0usize;
+        for p in proposals {
+            let filename = std::path::Path::new(&p.source_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from);
+            let Some(filename) = filename else { continue; };
+            match self.ops.validate_proposal(&filename).await {
+                Ok(report) if report.ok => {
+                    match self.ops.promote_from_proposal(&filename, None).await {
+                        Ok(row) => {
+                            self.ops.events.publish(ForgeEvent::SkillAutoPromoted {
+                                name: row.name.clone(),
+                                sha:  row.sha.clone(),
+                                version: row.version.clone(),
+                            }).await.ok();
+                            tracing::info!(name = %row.name, sha = %row.sha, "autopromoted skill");
+                            promoted += 1;
+                        }
+                        Err(e) => tracing::warn!(err = %e, filename = %filename, "autopromoter: promotion failed after validation passed"),
+                    }
+                }
+                Ok(report) => {
+                    tracing::debug!(filename = %filename, failed = ?report.hard_failures(), "autopromoter: proposal did not pass validation");
+                }
+                Err(e) => tracing::warn!(err = %e, filename = %filename, "autopromoter: validation error"),
+            }
+        }
+        Ok(promoted)
+    }
+
+    /// Spawn the loop. Returns immediately; the task keeps running until the
+    /// event bus is dropped. Uses `tokio::time::interval` so ticks don't
+    /// pile up if a sweep takes longer than the interval.
+    pub fn spawn(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(self.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the immediate first tick — boot already ran seed_missing_history.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match self.sweep().await {
+                    Ok(0)  => tracing::trace!("autopromoter sweep: 0 promoted"),
+                    Ok(n)  => tracing::info!(count = n, "autopromoter sweep completed"),
+                    Err(e) => tracing::warn!(err = %e, "autopromoter sweep error"),
+                }
+            }
+        });
     }
 }
 

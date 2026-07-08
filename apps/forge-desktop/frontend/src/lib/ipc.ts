@@ -116,3 +116,71 @@ export async function deleteSecret(name: string): Promise<void> {
 export async function exportAudit(dest: string): Promise<AuditExportResult> {
   return invoke<AuditExportResult>("export_audit", { dest });
 }
+
+// ---- Phase 4a/4b: skills governance ----
+
+export interface SkillProposalSummary {
+  name: string;
+  version: string;
+  description: string;
+  filename: string;
+}
+
+export interface SkillVersion {
+  name: string;
+  sha: string;
+  version: string;
+  origin: "proposal" | "handcrafted" | "rollback" | "curated";
+  origin_mission_id: string | null;
+  parent_sha: string | null;
+  promoted_at: string;
+  retired_at: string | null;
+  reason: string | null;
+}
+
+export interface CuratorSuggestion {
+  name: string;
+  kind: "duplicate" | "unused";
+  evidence: string;
+}
+
+export interface ValidationCheck {
+  id: string;
+  severity: "hard" | "soft";
+  passed: boolean;
+  message: string;
+}
+
+export interface ValidationReport {
+  ok: boolean;
+  checks: ValidationCheck[];
+}
+
+export async function listSkillProposals(): Promise<SkillProposalSummary[]> {
+  return invoke<SkillProposalSummary[]>("list_skill_proposals");
+}
+export async function approveSkillProposal(filename: string): Promise<string> {
+  return invoke<string>("approve_skill_proposal", { filename });
+}
+export async function rejectSkillProposal(filename: string): Promise<void> {
+  await invoke("reject_skill_proposal", { filename });
+}
+export async function validateSkillProposal(filename: string): Promise<ValidationReport> {
+  return invoke<ValidationReport>("validate_skill_proposal", { filename });
+}
+
+export async function listActiveSkills(): Promise<SkillVersion[]> {
+  return invoke<SkillVersion[]>("list_active_skills");
+}
+export async function listSkillVersions(name: string): Promise<SkillVersion[]> {
+  return invoke<SkillVersion[]>("list_skill_versions", { name });
+}
+export async function rollbackSkill(name: string, sha: string, reason?: string): Promise<SkillVersion> {
+  return invoke<SkillVersion>("rollback_skill", { name, sha, reason: reason ?? null });
+}
+export async function retireSkill(name: string, reason: string): Promise<string | null> {
+  return invoke<string | null>("retire_skill", { name, reason });
+}
+export async function runCurator(): Promise<CuratorSuggestion[]> {
+  return invoke<CuratorSuggestion[]>("run_curator");
+}

@@ -232,6 +232,79 @@ All fail loudly if `skills_root` isn't configured on the runtime.
 
 ---
 
+## Phase 4b — Validation gate + AutoPromoter + Skills UI (SHIPPED)
+
+**Motivation (agent.txt):** *"Learning should require validation before promotion."* Phase 4b lands the gate + a background sweeper + the Settings > Skills panel (closing the deferred 4a-frontend slice).
+
+### Validator — `crates/forge-skills/src/validate.rs`
+
+- **`SkillValidator::new(ctx)`** with `ValidatorContext { known_tools, active_skills }`.
+- **`ValidationReport { ok, checks: Vec<ValidationCheck> }`** — `ValidationCheck { id, level: Hard|Soft, passed, message }`. `ok` is true iff every **hard** check passes; soft failures do not gate promotion.
+- **5 hard checks:**
+  - `parses` — YAML front-matter deserializes
+  - `body_length` — `body.split_whitespace().map(str::len).sum() >= 40`
+  - `has_trigger` — non-empty keywords **or** file_globs
+  - `tools_declared` — tools list non-empty
+  - `tools_resolvable` — every tool either in `known_tools` **or** starts with `mcp:` (MCP tools are always accepted; policy gate handles them at runtime)
+- **3 soft checks:**
+  - `no_name_collision` — ≥3-keyword overlap with any **other** active skill (using `active_skills`)
+  - `version_monotonic` — same-named active skill has higher semver (3-component `parse3`)
+  - `keywords_normalised` — any uppercase keyword (matcher is case-insensitive; warn only)
+- 10 unit tests cover each check (`cargo test -p forge-skills validate::`).
+
+### SkillOps integration — `crates/forge-runtime/src/skills_ops.rs`
+
+- **`SkillOps::with_tools(...)`** — new constructor that takes `known_tools: Vec<String>` (fed by `ToolRegistry::names()`). The plain `SkillOps::new` still works with an empty whitelist for isolated tests.
+- **`SkillOps::validate_proposal(filename)`** — public; loads the file, snapshots active-skill keywords by re-scanning `active/` (bounded ≤50), runs the validator, returns `ValidationReport`.
+- **`promote_from_proposal` gate:**
+  1. assert `proposed/<filename>` exists
+  2. `validate_proposal(filename)`
+  3. if `!report.ok` → publish `SkillValidationFailed { filename, name, failed_checks }` + return `SkillOpsError::ValidationFailed { filename, failed }`; file left in `proposed/`
+  4. else publish `SkillValidationPassed { filename, name, soft_failures }` and continue original 4a promotion flow
+
+### AutoPromoter — `crates/forge-runtime/src/skills_ops.rs` (bottom)
+
+- **`AutoPromoter::new(ops, events, interval)`** + **`Arc<AutoPromoter>::spawn(self)`** — background tokio loop with `MissedTickBehavior::Delay` (no stampede on slow sweeps). First tick is skipped (boot already ran `seed_missing_history`).
+- **`sweep() -> Vec<String>`** — enumerates `proposed/`, validates each, promotes passing ones, publishes `SkillAutoPromoted { name, sha, version }` (distinct from human-approved `SkillPromoted`).
+- Off by default via `RuntimeConfig.auto_promote_skills = false`; interval clamped to `max(30, autopromote_interval_secs)` seconds.
+
+### Events (`crates/forge-domain/src/event.rs`)
+
+Three new variants, all `AggregateKind::Skill`:
+- `SkillValidationPassed { filename, name, soft_failures }`
+- `SkillValidationFailed { filename, name, failed_checks }`
+- `SkillAutoPromoted { name, sha, version }`
+
+### Runtime + Tool wiring
+
+- `crates/forge-tools/src/lib.rs`: added `ToolRegistry::names() -> Vec<String>` (used to seed the validator whitelist).
+- `RuntimeConfig` extended: `auto_promote_skills: bool` (default false, `#[serde(default)]`), `autopromote_interval_secs: u64` (default 300).
+- `Runtime::boot` now passes `tools.names()` to `SkillOps::with_tools(...)` and spawns the `AutoPromoter` when `auto_promote_skills = true`.
+
+### IPC (`apps/forge-desktop/src-tauri/src/lib.rs`)
+
+- New command **`validate_skill_proposal(filename) -> ValidationReport`** (returns the report as-is; `ValidationReport` derives `Serialize`).
+- Registered in `invoke_handler`; existing 4a commands unchanged.
+
+### Frontend — Settings > Skills
+
+- **`SkillsSection`** in `views/Settings.tsx` (~200 LOC total across three components):
+  - **`ProposalRow`** — per-proposal card: Validate button renders green/red per-check badges; Approve is disabled until validation passes; Reject drops the file.
+  - **`ActiveSkillRow`** — expands to full history (proposal / rollback / handcrafted origin badges); one-click Rollback (with reason prompt) and Retire (with reason).
+  - Curator suggestions listed underneath with kind badges.
+- **`lib/ipc.ts`** — 9 wrappers: `listSkillProposals`, `approveSkillProposal`, `rejectSkillProposal`, `validateSkillProposal`, `listActiveSkills`, `listSkillVersions`, `rollbackSkill`, `retireSkill`, `runCurator`. Types added: `SkillProposalSummary`, `SkillVersion`, `CuratorSuggestion`, `ValidationCheck`, `ValidationReport`.
+- **`lib/events.ts` + `event-filter.ts` + `views/EventTimeline.tsx`** — new event variants added, categorized under `meta`, with summarize cases (per-event human-readable line).
+
+### Verify
+
+- `cargo test -p forge-persistence -p forge-skills -p forge-runtime` → **56 pass** (24 runtime + 32 skills = 22 old + 10 new validator)
+- `cargo run -p forge-runtime --example skill_validation_smoke` → 3 scenarios PASS: good→promote, bad→ValidationFailed(`body_length`,`has_trigger`,`tools_resolvable`), AutoPromoter.sweep() picks up a fresh good one and emits `SkillAutoPromoted`
+- `cargo run -p forge-runtime --example skill_versioning_smoke` → 6/6 scenarios still pass (bodies extended to satisfy the new `body_length` gate; tools/keywords added to satisfy `tools_declared`/`has_trigger` — this is exactly the behaviour we want from the validator)
+- Frontend `npx tsc --noEmit` → clean
+
+---
+
+
 ## Frontend surface
 
 **Stores** (`apps/forge-desktop/frontend/src/stores/`)

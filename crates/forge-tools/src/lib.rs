@@ -66,6 +66,12 @@ impl ToolRegistry {
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools.values().map(|t| t.schema()).collect()
     }
+
+    /// All registered tool names. Used by the Phase 4b skill validator to
+    /// hard-reject proposals that reference tools the runtime doesn't have.
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

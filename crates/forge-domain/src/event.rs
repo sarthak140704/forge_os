@@ -175,6 +175,37 @@ pub enum ForgeEvent {
         kind:     String,
         evidence: String,
     },
+
+    /// A proposal cleared every hard validator check. Emitted BEFORE the
+    /// promotion writes to disk so audit trails show validation gates were
+    /// run first. `soft_failures` lists the ids of any warnings (e.g.
+    /// keyword collision) that did not block promotion.
+    SkillValidationPassed {
+        filename:      String,
+        name:          String,
+        soft_failures: Vec<String>,
+    },
+
+    /// A proposal tripped at least one hard validator check. The proposal
+    /// remains in `proposed/`; no active state changed. `failed_checks`
+    /// lists the ids that failed (e.g. `body_length`, `tools_resolvable`).
+    SkillValidationFailed {
+        filename:      String,
+        name:          String,
+        failed_checks: Vec<String>,
+    },
+
+    /// The autopromoter background loop promoted a proposal without human
+    /// approval because it passed validation and the runtime is configured
+    /// with `auto_promote_skills = true`. The corresponding
+    /// `SkillPromoted` event is also published; this variant exists so the
+    /// timeline can distinguish "human clicked approve" from "autopromoter
+    /// approved on its own".
+    SkillAutoPromoted {
+        name:    String,
+        sha:     String,
+        version: String,
+    },
 }
 
 impl ForgeEvent {
@@ -224,7 +255,11 @@ impl ForgeEvent {
             SkillPromoted { name, .. }
             | SkillRolledBack { name, .. }
             | SkillRetired { name, .. }
-            | SkillCurationSuggested { name, .. } => format!("skill_{name}"),
+            | SkillCurationSuggested { name, .. }
+            | SkillAutoPromoted { name, .. } => format!("skill_{name}"),
+
+            SkillValidationPassed { name, .. }
+            | SkillValidationFailed { name, .. } => format!("skill_{name}"),
         }
     }
 
@@ -268,7 +303,10 @@ impl ForgeEvent {
             SkillPromoted { .. }
             | SkillRolledBack { .. }
             | SkillRetired { .. }
-            | SkillCurationSuggested { .. } => AggregateKind::Skill,
+            | SkillCurationSuggested { .. }
+            | SkillValidationPassed { .. }
+            | SkillValidationFailed { .. }
+            | SkillAutoPromoted { .. } => AggregateKind::Skill,
         }
     }
 
@@ -314,6 +352,9 @@ impl ForgeEvent {
             SkillRolledBack { .. } => "skill_rolled_back",
             SkillRetired { .. } => "skill_retired",
             SkillCurationSuggested { .. } => "skill_curation_suggested",
+            SkillValidationPassed { .. } => "skill_validation_passed",
+            SkillValidationFailed { .. } => "skill_validation_failed",
+            SkillAutoPromoted { .. } => "skill_auto_promoted",
         }
     }
 }

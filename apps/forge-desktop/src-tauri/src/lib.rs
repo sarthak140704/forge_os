@@ -326,6 +326,15 @@ async fn run_curator(state: State<'_, Arc<AppState>>) -> Result<Vec<CuratorSugge
     curator.run().await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn validate_skill_proposal(
+    state: State<'_, Arc<AppState>>,
+    filename: String,
+) -> Result<forge_skills::ValidationReport, String> {
+    let ops = require_skill_ops(&state)?;
+    ops.validate_proposal(&filename).await.map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // App entry
 // ---------------------------------------------------------------------------
@@ -384,6 +393,7 @@ pub fn run() {
             rollback_skill,
             retire_skill,
             run_curator,
+            validate_skill_proposal,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
@@ -452,6 +462,8 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         max_parallel_goals: 4,
         skills_root: Some(app_data.join("skills")),
         mcp_config: Some(app_data.join("mcp.yaml")),
+        auto_promote_skills: false,
+        autopromote_interval_secs: 300,
     };
     // On first run, seed the skills dir from the bundled defaults if it's empty.
     let skills_root = app_data.join("skills").join("active");

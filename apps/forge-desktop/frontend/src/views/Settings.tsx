@@ -5,12 +5,24 @@ import { Badge, Button, Card } from "@/components/ui/primitives";
 import {
   deleteSecret,
   exportAudit,
+  listActiveSkills,
   listCheckpoints,
   listSecretStatus,
+  listSkillProposals,
+  listSkillVersions,
+  rejectSkillProposal,
+  retireSkill,
   revertCheckpoint,
+  rollbackSkill,
+  runCurator,
   setSecret,
+  validateSkillProposal,
   type Checkpoint,
+  type CuratorSuggestion,
   type SecretStatus,
+  type SkillProposalSummary,
+  type SkillVersion,
+  type ValidationReport,
 } from "@/lib/ipc";
 import { useUiStore } from "@/stores/ui";
 
@@ -46,6 +58,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         <div className="flex-1 overflow-y-auto p-5 space-y-6">
           <SecretsSection />
           <CheckpointsSection />
+          <SkillsSection />
           <AuditSection />
         </div>
       </div>
@@ -227,6 +240,230 @@ function CheckpointRow({ cp, onReverted }: { cp: Checkpoint; onReverted: () => v
       <div className="text-xs text-forge-muted font-mono">
         +{cp.insertions} −{cp.deletions} · {cp.files_changed} file{cp.files_changed === 1 ? "" : "s"}
       </div>
+    </div>
+  );
+}
+
+// ---------- Skills (Phase 4a/4b) ----------
+
+function SkillsSection() {
+  const qc = useQueryClient();
+  const active     = useQuery({ queryKey: ["skills-active"], queryFn: listActiveSkills });
+  const proposals  = useQuery({ queryKey: ["skills-proposals"], queryFn: listSkillProposals });
+  const [suggestions, setSuggestions] = useState<CuratorSuggestion[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["skills-active"] });
+    qc.invalidateQueries({ queryKey: ["skills-proposals"] });
+  };
+
+  const doRunCurator = async () => {
+    setBusy(true);
+    try { setSuggestions(await runCurator()); }
+    catch (e) { alert(`Curator failed: ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Section
+      title="Skills"
+      hint="Version-controlled procedural knowledge. Every promotion is validated; every rollback is bit-exact."
+    >
+      <div className="flex items-center gap-2">
+        <Button variant="ghost" onClick={invalidate}>Refresh</Button>
+        <Button onClick={doRunCurator} disabled={busy}>Run curator</Button>
+      </div>
+
+      {/* Proposals */}
+      <div>
+        <div className="text-xs font-semibold text-forge-muted mb-2">
+          Pending proposals ({proposals.data?.length ?? 0})
+        </div>
+        {proposals.isLoading && <Muted>Loading…</Muted>}
+        {proposals.data?.length === 0 && <Muted>No proposals awaiting review.</Muted>}
+        <div className="space-y-2">
+          {proposals.data?.map((p) => (
+            <ProposalRow key={p.filename} proposal={p} onChanged={invalidate} />
+          ))}
+        </div>
+      </div>
+
+      {/* Active */}
+      <div>
+        <div className="text-xs font-semibold text-forge-muted mb-2">
+          Active skills ({active.data?.length ?? 0})
+        </div>
+        {active.isLoading && <Muted>Loading…</Muted>}
+        {active.data?.length === 0 && <Muted>No active skills yet.</Muted>}
+        <div className="space-y-2">
+          {active.data?.map((s) => (
+            <ActiveSkillRow key={s.name} skill={s} onChanged={invalidate} />
+          ))}
+        </div>
+      </div>
+
+      {/* Curator suggestions */}
+      {suggestions && (
+        <div>
+          <div className="text-xs font-semibold text-forge-muted mb-2">
+            Curator suggestions ({suggestions.length})
+          </div>
+          {suggestions.length === 0 && <Muted>No suggestions — the catalog looks clean.</Muted>}
+          <div className="space-y-2">
+            {suggestions.map((s, i) => (
+              <div key={i} className="p-2 rounded border border-forge-border bg-forge-panel/40 text-xs">
+                <Badge tone={s.kind === "duplicate" ? "warn" : "info"}>{s.kind}</Badge>
+                <span className="ml-2 font-mono">{s.name}</span>
+                <span className="ml-2 text-forge-muted">— {s.evidence}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+function ProposalRow({
+  proposal,
+  onChanged,
+}: {
+  proposal: SkillProposalSummary;
+  onChanged: () => void;
+}) {
+  const [report, setReport] = useState<ValidationReport | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const doValidate = async () => {
+    setBusy(true);
+    try { setReport(await validateSkillProposal(proposal.filename)); }
+    catch (e) { alert(`Validate failed: ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  const doApprove = async () => {
+    setBusy(true);
+    try {
+      // Backend runs validation as part of promote — if it fails we
+      // surface the message instead of silently swallowing.
+      const { approveSkillProposal } = await import("@/lib/ipc");
+      await approveSkillProposal(proposal.filename);
+      onChanged();
+    } catch (e) {
+      alert(`Approve failed: ${String(e)}`);
+    } finally { setBusy(false); }
+  };
+
+  const doReject = async () => {
+    if (!confirm(`Reject proposal "${proposal.name}"? The file will be deleted.`)) return;
+    setBusy(true);
+    try { await rejectSkillProposal(proposal.filename); onChanged(); }
+    catch (e) { alert(`Reject failed: ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="p-2 rounded border border-forge-border bg-forge-panel/40 space-y-1">
+      <div className="flex items-center gap-2">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-mono truncate">{proposal.name}</div>
+          <div className="text-xs text-forge-muted truncate">
+            v{proposal.version} · {proposal.description}
+          </div>
+        </div>
+        <Button variant="ghost" onClick={doValidate} disabled={busy}>Validate</Button>
+        <Button onClick={doApprove} disabled={busy}>Approve</Button>
+        <Button variant="danger" onClick={doReject} disabled={busy}>Reject</Button>
+      </div>
+      {report && (
+        <div className="text-xs space-y-0.5 mt-2">
+          <div className="text-forge-muted">
+            {report.ok ? "✅ passes hard checks" : "❌ hard-fail — cannot be promoted"}
+          </div>
+          {report.checks.map((c) => (
+            <div key={c.id} className="flex items-center gap-2">
+              <span className={c.passed ? "text-forge-success" : (c.severity === "hard" ? "text-forge-err" : "text-forge-warn")}>
+                {c.passed ? "✓" : (c.severity === "hard" ? "✕" : "!")}
+              </span>
+              <span className="font-mono">{c.id}</span>
+              {!c.passed && <span className="text-forge-muted">— {c.message}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ActiveSkillRow({
+  skill,
+  onChanged,
+}: {
+  skill: SkillVersion;
+  onChanged: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const versions = useQuery({
+    queryKey: ["skill-versions", skill.name],
+    queryFn: () => listSkillVersions(skill.name),
+    enabled: expanded,
+  });
+
+  const doRollback = async (v: SkillVersion) => {
+    const reason = prompt(`Rollback ${skill.name} to ${v.sha.slice(0, 8)}?\n\nOptional reason:`);
+    if (reason === null) return;
+    setBusy(true);
+    try { await rollbackSkill(skill.name, v.sha, reason || undefined); onChanged(); }
+    catch (e) { alert(`Rollback failed: ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  const doRetire = async () => {
+    const reason = prompt(`Retire ${skill.name}?\n\nRequired reason:`);
+    if (!reason) return;
+    setBusy(true);
+    try { await retireSkill(skill.name, reason); onChanged(); }
+    catch (e) { alert(`Retire failed: ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="p-2 rounded border border-forge-border bg-forge-panel/40 space-y-1">
+      <div className="flex items-center gap-2">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-mono truncate">{skill.name}</div>
+          <div className="text-xs text-forge-muted truncate">
+            v{skill.version} · <span className="font-mono">{skill.sha.slice(0, 12)}</span> · {skill.origin}
+          </div>
+        </div>
+        <Button variant="ghost" onClick={() => setExpanded(!expanded)}>
+          {expanded ? "Hide history" : "History"}
+        </Button>
+        <Button variant="danger" onClick={doRetire} disabled={busy}>Retire</Button>
+      </div>
+      {expanded && (
+        <div className="mt-2 space-y-1 text-xs">
+          {versions.isLoading && <Muted>Loading history…</Muted>}
+          {versions.data?.map((v) => (
+            <div key={v.sha + v.promoted_at} className="flex items-center gap-2 p-1 pl-3 border-l border-forge-border">
+              <span className="font-mono text-forge-accent">{v.sha.slice(0, 12)}</span>
+              <Badge tone={v.origin === "rollback" ? "warn" : "info"}>{v.origin}</Badge>
+              <span className="text-forge-muted">v{v.version}</span>
+              <span className="text-forge-muted">· {new Date(v.promoted_at).toLocaleString()}</span>
+              {v.retired_at && <Badge tone="default">retired</Badge>}
+              <div className="flex-1" />
+              {v.sha !== skill.sha && !v.retired_at && (
+                <Button variant="ghost" onClick={() => doRollback(v)} disabled={busy}>Rollback</Button>
+              )}
+              {v.sha !== skill.sha && v.retired_at && (
+                <Button variant="ghost" onClick={() => doRollback(v)} disabled={busy}>Restore</Button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -49,6 +49,9 @@ function summarize(e: ForgeEvent): string {
     case "skill_rolled_back": return `Skill rolled back: ${e.name} → ${e.to_sha.slice(0, 8)}${e.reason ? ` (${e.reason})` : ""}`;
     case "skill_retired": return `Skill retired: ${e.name} (${e.sha.slice(0, 8)}) — ${e.reason}`;
     case "skill_curation_suggested": return `Curator: ${e.kind} — ${e.name} (${e.evidence})`;
+    case "skill_validation_passed": return `Skill validation passed: ${e.name}${e.soft_failures.length ? ` (warnings: ${e.soft_failures.join(", ")})` : ""}`;
+    case "skill_validation_failed": return `Skill validation FAILED: ${e.name} — ${e.failed_checks.join(", ")}`;
+    case "skill_auto_promoted": return `Skill AUTO-promoted: ${e.name} v${e.version} (${e.sha.slice(0, 8)})`;
     default: return JSON.stringify(e);
   }
 }
