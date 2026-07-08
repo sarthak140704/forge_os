@@ -69,6 +69,14 @@ export function eventMissionId(
     case "mcp_server_started":
     case "mcp_server_failed":
       return null;
+    // Skill lifecycle — global (not scoped to a specific mission at runtime;
+    // origin_mission_id is only reference data).
+    case "skill_promoted":
+      return ev.origin_mission_id ?? null;
+    case "skill_rolled_back":
+    case "skill_retired":
+    case "skill_curation_suggested":
+      return null;
     default:
       return null;
   }
@@ -78,7 +86,7 @@ export type EventCategory = "mission" | "goal" | "task" | "llm" | "plugin" | "me
 
 export function eventCategory(ev: ForgeEvent): EventCategory {
   const t = ev.type;
-  if (t.startsWith("mission_cost") || t.startsWith("mission_reflection") || t.startsWith("skill_proposal") || t.startsWith("skills_selected") || t.startsWith("replan_") || t === "plan_revised" || t === "episodic_recall_surfaced" || t === "checkpoint_created" || t === "checkpoint_skipped") return "meta";
+  if (t.startsWith("mission_cost") || t.startsWith("mission_reflection") || t.startsWith("skill_") || t.startsWith("skills_selected") || t.startsWith("replan_") || t === "plan_revised" || t === "episodic_recall_surfaced" || t === "checkpoint_created" || t === "checkpoint_skipped") return "meta";
   if (t.startsWith("mission_")) return "mission";
   if (t.startsWith("goal_")) return "goal";
   if (t.startsWith("task_") || t === "tool_invoked" || t.startsWith("policy_")) return "task";

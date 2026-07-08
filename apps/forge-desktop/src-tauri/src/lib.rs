@@ -9,7 +9,10 @@
 use forge_domain::{ForgeEvent, MissionId, MissionSummary, TaskId};
 use forge_events::EventBus;
 use forge_mission::{MissionDetail, MissionService};
-use forge_runtime::{Checkpoint, CheckpointStore, LlmConfig, LlmProviderConfig, Runtime, RuntimeConfig};
+use forge_runtime::{
+    skills_ops::{Curator, CuratorSuggestion, SkillOps},
+    Checkpoint, CheckpointStore, LlmConfig, LlmProviderConfig, Runtime, RuntimeConfig,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -24,6 +27,8 @@ struct AppState {
     skills_root: PathBuf,
     checkpoints: CheckpointStore,
     pool: sqlx::SqlitePool,
+    skill_ops: Option<Arc<SkillOps>>,
+    curator:   Option<Arc<Curator>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +235,97 @@ async fn export_audit(
     })
 }
 
+// ---- Phase 4a: version-controlled skills ----
+
+#[derive(Serialize)]
+struct SkillVersionDto {
+    name:              String,
+    sha:               String,
+    version:           String,
+    origin:            String,
+    origin_mission_id: Option<String>,
+    parent_sha:        Option<String>,
+    promoted_at:       String,
+    retired_at:        Option<String>,
+    reason:            Option<String>,
+}
+
+impl From<forge_persistence::SkillVersionRecord> for SkillVersionDto {
+    fn from(r: forge_persistence::SkillVersionRecord) -> Self {
+        Self {
+            name: r.name,
+            sha: r.sha,
+            version: r.version,
+            origin: match r.origin {
+                forge_persistence::SkillOrigin::Proposal   => "proposal",
+                forge_persistence::SkillOrigin::Handcrafted => "handcrafted",
+                forge_persistence::SkillOrigin::Rollback   => "rollback",
+                forge_persistence::SkillOrigin::Curated    => "curated",
+            }.into(),
+            origin_mission_id: r.origin_mission_id,
+            parent_sha: r.parent_sha,
+            promoted_at: r.promoted_at,
+            retired_at: r.retired_at,
+            reason: r.reason,
+        }
+    }
+}
+
+fn require_skill_ops(state: &AppState) -> Result<Arc<SkillOps>, String> {
+    state.skill_ops.clone().ok_or_else(|| "skills subsystem is not configured (skills_root missing)".to_string())
+}
+
+fn require_curator(state: &AppState) -> Result<Arc<Curator>, String> {
+    state.curator.clone().ok_or_else(|| "curator is not configured (skills_root missing)".to_string())
+}
+
+#[tauri::command]
+async fn list_active_skills(state: State<'_, Arc<AppState>>) -> Result<Vec<SkillVersionDto>, String> {
+    let ops = require_skill_ops(&state)?;
+    let rows = ops.history.list_active().await.map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(SkillVersionDto::from).collect())
+}
+
+#[tauri::command]
+async fn list_skill_versions(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<Vec<SkillVersionDto>, String> {
+    let ops = require_skill_ops(&state)?;
+    let rows = ops.history.history(&name).await.map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(SkillVersionDto::from).collect())
+}
+
+#[tauri::command]
+async fn rollback_skill(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    sha: String,
+    reason: Option<String>,
+) -> Result<SkillVersionDto, String> {
+    let ops = require_skill_ops(&state)?;
+    let row = ops.rollback(&name, &sha, reason.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(SkillVersionDto::from(row))
+}
+
+#[tauri::command]
+async fn retire_skill(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    reason: String,
+) -> Result<Option<String>, String> {
+    let ops = require_skill_ops(&state)?;
+    ops.retire(&name, &reason).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn run_curator(state: State<'_, Arc<AppState>>) -> Result<Vec<CuratorSuggestion>, String> {
+    let curator = require_curator(&state)?;
+    curator.run().await.map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // App entry
 // ---------------------------------------------------------------------------
@@ -283,6 +379,11 @@ pub fn run() {
             set_secret,
             delete_secret,
             export_audit,
+            list_active_skills,
+            list_skill_versions,
+            rollback_skill,
+            retire_skill,
+            run_curator,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
@@ -379,6 +480,8 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         skills_root: app_data.join("skills"),
         checkpoints: runtime.checkpoints,
         pool: runtime.pool,
+        skill_ops: runtime.skill_ops,
+        curator:   runtime.curator,
     }))
 }
 

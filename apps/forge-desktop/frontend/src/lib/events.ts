@@ -98,7 +98,11 @@ export type ForgeEvent =
   | { type: "checkpoint_skipped"; tool: string; mission_id?: string | null; task_id?: string | null; reason: string }
   | { type: "mcp_server_started"; name: string; tools: string[] }
   | { type: "mcp_server_failed"; name: string; error: string }
-  | { type: "mcp_tool_invoked"; server: string; tool: string; task_id?: string | null };
+  | { type: "mcp_tool_invoked"; server: string; tool: string; task_id?: string | null }
+  | { type: "skill_promoted"; name: string; sha: string; version: string; origin: string; parent_sha?: string | null; origin_mission_id?: string | null }
+  | { type: "skill_rolled_back"; name: string; from_sha?: string | null; to_sha: string; reason?: string | null }
+  | { type: "skill_retired"; name: string; sha: string; reason: string }
+  | { type: "skill_curation_suggested"; name: string; kind: string; evidence: string };
 
 export interface EventEnvelope {
   seq: number;

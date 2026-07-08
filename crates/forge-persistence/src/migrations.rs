@@ -54,3 +54,33 @@ CREATE TABLE IF NOT EXISTS reflections (
     PRIMARY KEY (mission_id, created_at)
 ) STRICT;
 "#;
+
+/// Phase 4a — Version-controlled skills.
+///
+/// Immutable history log: every skill promotion, rollback, or retirement
+/// appends a row here. The active version is the most-recent row for a
+/// given name whose `retired_at` IS NULL. Content is content-addressed by
+/// `sha` — the byte SHA-256 of the SKILL.md file we snapshotted at
+/// promotion time. Rollback = promote a prior sha (new row, same sha).
+///
+/// Nothing here overwrites: every state change appends. This mirrors the
+/// event-sourcing discipline used elsewhere in the runtime and satisfies
+/// agent.txt's mandate "Every learned improvement should be
+/// version-controlled. Nothing should ever be overwritten."
+pub const V002_SKILLS_HISTORY: &str = r#"
+CREATE TABLE IF NOT EXISTS skills_history (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    name              TEXT    NOT NULL,
+    sha               TEXT    NOT NULL,
+    version           TEXT    NOT NULL,
+    origin            TEXT    NOT NULL,
+    origin_mission_id TEXT,
+    parent_sha        TEXT,
+    promoted_at       TEXT    NOT NULL,
+    retired_at        TEXT,
+    reason            TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_skills_history_name       ON skills_history(name, id);
+CREATE INDEX IF NOT EXISTS idx_skills_history_sha        ON skills_history(sha);
+CREATE INDEX IF NOT EXISTS idx_skills_history_promoted   ON skills_history(promoted_at);
+"#;

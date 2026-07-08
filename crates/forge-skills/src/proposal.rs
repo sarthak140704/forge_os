@@ -110,8 +110,29 @@ fn sanitize(s: &str) -> String {
 }
 
 /// Move a proposal file from `proposed/` to the active root. Also rewrites
-/// the front-matter `status` to `active`.
+/// the front-matter `status` to `active`. Returns `(dst_path, sha, name, version)`
+/// so the caller can immediately record the promotion in `skills_history` +
+/// snapshot the bytes in the content store.
+///
+/// This is the byte-manipulation half of the promotion. See
+/// `runtime::skills::promote_from_proposal` for the full flow that also
+/// touches history + version store + event bus.
 pub fn approve_proposal(skills_root: &Path, proposal_filename: &str) -> Result<PathBuf, SkillError> {
+    let (dst, _sha, _name, _version) = approve_proposal_detail(skills_root, proposal_filename)?;
+    Ok(dst)
+}
+
+/// Rich variant of [`approve_proposal`] used by the runtime/IPC layer to
+/// record a full history row alongside the file move.
+///
+/// The returned tuple is `(active_path, content_sha, skill_name, version)`.
+/// `content_sha` is the SHA-256 of the exact bytes written to `active/`
+/// (front-matter flipped to `status: active` before hashing so it matches
+/// what the loader will subsequently see).
+pub fn approve_proposal_detail(
+    skills_root: &Path,
+    proposal_filename: &str,
+) -> Result<(PathBuf, String, String, String), SkillError> {
     let src = skills_root.join("proposed").join(proposal_filename);
     if !src.exists() {
         return Err(SkillError::Malformed {
@@ -132,11 +153,69 @@ pub fn approve_proposal(skills_root: &Path, proposal_filename: &str) -> Result<P
     doc.push_str(&skill.body);
     doc.push('\n');
 
+    let sha = crate::versions::SkillVersionStore::hash(doc.as_bytes());
+    let name = skill.front.name.clone();
+    let version = skill.front.version.clone();
+
     let dst_dir = skills_root.join("active");
     std::fs::create_dir_all(&dst_dir)?;
     let dst = dst_dir.join(proposal_filename);
     std::fs::write(&dst, doc)?;
     std::fs::remove_file(&src)?;
+    Ok((dst, sha, name, version))
+}
+
+/// Move every active file whose front-matter `name` matches to
+/// `<skills_root>/archived/`. Idempotent — returns the count moved (0 if
+/// none). Prior versions of this helper stopped after the first hit, but
+/// the promote→rollback→retire path can legitimately leave multiple stale
+/// `.md` files in `active/` for the same skill (proposal timestamped
+/// filenames + the canonical `<name>.md` produced by `restore_from_bytes`).
+/// Retiring must clean them all up so a later `promote` doesn't resurrect
+/// a stale sha.
+pub fn retire_active_skill(skills_root: &Path, name: &str) -> Result<usize, SkillError> {
+    let active_dir = skills_root.join("active");
+    if !active_dir.exists() { return Ok(0); }
+    let mut moved = 0usize;
+    for entry in std::fs::read_dir(&active_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+        let raw = match std::fs::read_to_string(&path) { Ok(r) => r, Err(_) => continue };
+        let parsed = match crate::parse_skill(&raw) { Ok(s) => s, Err(_) => continue };
+        if parsed.front.name != name { continue; }
+        let dst_dir = skills_root.join("archived");
+        std::fs::create_dir_all(&dst_dir)?;
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let mut dst = dst_dir.join(&file_name);
+        // On name collision in archived/, disambiguate by suffixing a counter.
+        let mut n = 1usize;
+        while dst.exists() {
+            dst = dst_dir.join(format!("{n}-{file_name}"));
+            n += 1;
+        }
+        std::fs::rename(&path, &dst)?;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+/// Restore the exact bytes stored at `sha` to `<skills_root>/active/<name>.md`,
+/// replacing whatever active version of `name` currently exists. Used by
+/// `rollback_skill`. Returns the written active path.
+pub fn restore_from_bytes(
+    skills_root: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, SkillError> {
+    // Move any current active version aside first.
+    let _ = retire_active_skill(skills_root, name)?;
+    let dst_dir = skills_root.join("active");
+    std::fs::create_dir_all(&dst_dir)?;
+    // Use a stable filename derived from the skill name (roll-back writes
+    // one file, not a timestamped one).
+    let filename = format!("{}.md", sanitize(name));
+    let dst = dst_dir.join(&filename);
+    std::fs::write(&dst, bytes)?;
     Ok(dst)
 }
 

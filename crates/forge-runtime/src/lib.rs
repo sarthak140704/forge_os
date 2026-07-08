@@ -38,6 +38,7 @@ pub mod episodic_recall;
 pub mod checkpoints;
 pub mod secrets;
 pub mod audit;
+pub mod skills_ops;
 pub use memory::ProjectMemory;
 pub use user_memory::UserMemory;
 pub use feature_flags::FeatureFlags;
@@ -230,6 +231,14 @@ pub struct Runtime {
     pub goals: Arc<SqliteGoalRepository>,
     /// Task repository. See `goals` above for rationale.
     pub tasks: Arc<SqliteTaskRepository>,
+
+    /// Phase 4a — version-controlled skill operations (promote / rollback /
+    /// retire) + content-addressed history store. `None` when
+    /// `skills_root` isn't configured.
+    pub skill_ops: Option<Arc<skills_ops::SkillOps>>,
+    /// Phase 4a — curator that inspects the active set for duplicates and
+    /// unused entries. Emits advisory `SkillCurationSuggested` events.
+    pub curator:   Option<Arc<skills_ops::Curator>>,
 }
 
 impl Runtime {
@@ -557,7 +566,34 @@ impl Runtime {
             });
         }
 
-        Ok(Self { config, pool, events, missions, tools, llm, mcp, checkpoints, goals: goals_repo, tasks: tasks_repo })
+        // Phase 4a: version-controlled skills.
+        // Build SkillOps + Curator when skills_root is configured. If not,
+        // the runtime silently skips this subsystem — matches how the
+        // reflector and skills registry behave.
+        let (skill_ops, curator) = if let Some(root) = config.skills_root.clone() {
+            let hist_repo: Arc<dyn forge_persistence::SkillHistoryRepository> =
+                Arc::new(forge_persistence::SqliteSkillHistoryRepository::new(pool.clone()));
+            let ops = Arc::new(skills_ops::SkillOps::new(root, hist_repo, events.clone()));
+            // Best-effort seed on boot so hand-authored SKILL.md files show
+            // up in the history table.  Failures logged, not fatal.
+            match ops.seed_missing_history().await {
+                Ok(n) if n > 0 => tracing::info!(seeded = n, "seeded skill history for on-disk files"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(err = %e, "skill history seeding failed"),
+            }
+            // Rebuild the event-store handle for the curator (need EventStore,
+            // not the bus). Cheap Arc clone.
+            let curator_events = Arc::new(SqliteEventStore::new(pool.clone()));
+            let curator = Arc::new(skills_ops::Curator::new(ops.clone(), curator_events));
+            (Some(ops), Some(curator))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            config, pool, events, missions, tools, llm, mcp, checkpoints,
+            goals: goals_repo, tasks: tasks_repo, skill_ops, curator,
+        })
     }
 }
 

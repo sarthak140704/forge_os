@@ -130,6 +130,51 @@ pub enum ForgeEvent {
         task_id:    Option<TaskId>,
         reason:     String,
     },
+
+    // ---- Phase 4a: version-controlled skills ----
+
+    /// A skill was promoted — either from a proposal, hand-authored on disk,
+    /// or via rollback. Every promotion appends a row to `skills_history`
+    /// and snapshots the SKILL.md bytes in the content-addressed store.
+    /// Reversible via `SkillRolledBack`.
+    SkillPromoted {
+        name:              String,
+        sha:               String,
+        version:           String,
+        origin:            String, // handcrafted | proposal | curated | rollback
+        parent_sha:        Option<String>,
+        origin_mission_id: Option<MissionId>,
+    },
+
+    /// The active version of a skill was replaced by a prior version.
+    /// Not destructive — the "new" active row appends to history like any
+    /// other promotion, but its `origin=rollback` and its bytes are read
+    /// verbatim from the content store at `target_sha`.
+    SkillRolledBack {
+        name:            String,
+        from_sha:        Option<String>,
+        to_sha:          String,
+        reason:          Option<String>,
+    },
+
+    /// A skill was retired — its active history row now has `retired_at`
+    /// set and the active file was moved to `archived/`. Skills can be
+    /// re-promoted later; retirement is not deletion.
+    SkillRetired {
+        name:   String,
+        sha:    String,
+        reason: String,
+    },
+
+    /// The curator flagged a skill as a candidate for merge/dedupe/archive.
+    /// Purely advisory — the timeline surfaces it so the operator can
+    /// decide. The `kind` field is one of: `duplicate`, `unused`,
+    /// `merge_candidate`.
+    SkillCurationSuggested {
+        name:     String,
+        kind:     String,
+        evidence: String,
+    },
 }
 
 impl ForgeEvent {
@@ -175,6 +220,11 @@ impl ForgeEvent {
 
             CheckpointCreated { sha, .. } => format!("checkpoint_{sha}"),
             CheckpointSkipped { task_id, .. } => task_id.map(|t| t.to_string()).unwrap_or_else(|| "checkpoint_skip".into()),
+
+            SkillPromoted { name, .. }
+            | SkillRolledBack { name, .. }
+            | SkillRetired { name, .. }
+            | SkillCurationSuggested { name, .. } => format!("skill_{name}"),
         }
     }
 
@@ -214,6 +264,11 @@ impl ForgeEvent {
 
             CheckpointCreated { .. } => AggregateKind::Mission,
             CheckpointSkipped { .. } => AggregateKind::Mission,
+
+            SkillPromoted { .. }
+            | SkillRolledBack { .. }
+            | SkillRetired { .. }
+            | SkillCurationSuggested { .. } => AggregateKind::Skill,
         }
     }
 
@@ -255,6 +310,10 @@ impl ForgeEvent {
             EpisodicRecallSurfaced { .. } => "episodic_recall_surfaced",
             CheckpointCreated { .. } => "checkpoint_created",
             CheckpointSkipped { .. } => "checkpoint_skipped",
+            SkillPromoted { .. } => "skill_promoted",
+            SkillRolledBack { .. } => "skill_rolled_back",
+            SkillRetired { .. } => "skill_retired",
+            SkillCurationSuggested { .. } => "skill_curation_suggested",
         }
     }
 }
@@ -267,6 +326,7 @@ pub enum AggregateKind {
     Task,
     Llm,
     Plugin,
+    Skill,
 }
 
 impl AggregateKind {
@@ -277,6 +337,7 @@ impl AggregateKind {
             AggregateKind::Task => "task",
             AggregateKind::Llm => "llm",
             AggregateKind::Plugin => "plugin",
+            AggregateKind::Skill => "skill",
         }
     }
 }

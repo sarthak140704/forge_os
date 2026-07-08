@@ -151,6 +151,87 @@ sqlite pool → repos → event bus → tool registry (+ MCP adapters) → LLM r
 
 ---
 
+## Phase 4a — Version-controlled skills (SHIPPED)
+
+**Motivation (agent.txt):** *"Every learned improvement should be version-controlled. Nothing should ever be overwritten. Everything should be reversible."* Phase 4a lands the append-only history + content-addressed store + curator.
+
+### Persistence — `crates/forge-persistence`
+
+- **Migration `V002_SKILLS_HISTORY`** (`migrations.rs`, applied automatically in `connect()`). Creates:
+  ```sql
+  CREATE TABLE skills_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    sha  TEXT NOT NULL,
+    version TEXT NOT NULL,
+    origin TEXT NOT NULL,          -- proposal|handcrafted|rollback|curated
+    origin_mission_id TEXT NULL,
+    parent_sha TEXT NULL,
+    promoted_at TEXT NOT NULL,
+    retired_at  TEXT NULL,
+    reason TEXT NULL
+  );
+  CREATE INDEX idx_skills_history_name     ON skills_history (name, id);
+  CREATE INDEX idx_skills_history_sha      ON skills_history (sha);
+  CREATE INDEX idx_skills_history_promoted ON skills_history (promoted_at);
+  ```
+- **Types** (`lib.rs`): `SkillOrigin` enum, `SkillVersionRecord`, `NewSkillVersion`, trait `SkillHistoryRepository` with `promote/retire_active/active/history/list_active`.
+- **Impl** (`sqlite.rs`): `SqliteSkillHistoryRepository::new(pool)`. Currently-active for `name` = newest row with `retired_at IS NULL`. Rows are **never** mutated.
+
+### Content store — `crates/forge-skills/src/versions.rs`
+
+- **`SkillVersionStore::new(<skills_root>)`** — sharded `<root>/history/<3-char-shard>/<64-char-sha>.md`.
+- `hash(bytes)` → hex SHA-256; `put(sha, bytes)` — idempotent (skips write if the file already exists); `get(sha)` → bytes; `contains(sha)` → bool.
+- 3 unit tests: hash stability, put/get roundtrip, missing-sha error path.
+
+### Orchestration + curator — `crates/forge-runtime/src/skills_ops.rs`
+
+- **`SkillOps`** — owns `skills_root`, `history` repo, `store`, `events`.
+  - `promote_from_proposal(filename, origin_mission_id) -> SkillVersionRecord` — approves the proposal file, snapshots bytes into the content store, retires prior active row (if any), appends new row with `parent_sha` = prior sha, publishes `SkillPromoted`.
+  - `retire(name, reason) -> Option<String>` — moves ALL matching files in `active/` to `archived/`, sets `retired_at`, publishes `SkillRetired`. Returns the sha it retired (or `None` if nothing was active).
+  - `rollback(name, target_sha, reason) -> SkillVersionRecord` — restores bit-exact bytes from the content store to `active/<name>.md`, retires prior active row, appends a new `origin=rollback` row whose `sha == target_sha` and `parent_sha` = the sha it displaced. Publishes `SkillRolledBack`.
+  - `seed_missing_history()` — called at boot; every parseable file in `active/` without a matching history row is snapshotted with `origin=handcrafted`. Also catches on-disk edits (same name, different bytes → retire old + promote new).
+- **`Curator`** — advisory heuristics, no LLM:
+  - **Duplicate**: pairwise Jaro-Winkler on active names, threshold `≥ 0.90`.
+  - **Unused**: scans the event log for `SkillsSelected`; any active skill whose name never appears is flagged.
+  - Every finding also publishes `SkillCurationSuggested`.
+- **Retire-all fix** (`forge-skills/proposal.rs`): `retire_active_skill` now archives *every* file in `active/` whose front-matter name matches, disambiguating archived-dir collisions by `<n>-<filename>` prefix. Prior single-file version left stale copies after rollback.
+
+### Events (`crates/forge-domain/src/event.rs`)
+
+Four new variants — all classified as `AggregateKind::Skill`:
+- `SkillPromoted { name, sha, version, origin, parent_sha, origin_mission_id }`
+- `SkillRolledBack { name, from_sha, to_sha, reason }`
+- `SkillRetired { name, sha, reason }`
+- `SkillCurationSuggested { name, kind, evidence }`
+
+### IPC (`apps/forge-desktop/src-tauri/src/lib.rs`)
+
+Five new commands + `SkillVersionDto`:
+- `list_active_skills() -> Vec<SkillVersionDto>`
+- `list_skill_versions(name) -> Vec<SkillVersionDto>` (newest first, includes retired rows)
+- `rollback_skill(name, sha, reason?) -> SkillVersionDto`
+- `retire_skill(name, reason) -> Option<String>` (returns retired sha)
+- `run_curator() -> Vec<CuratorSuggestion>`
+All fail loudly if `skills_root` isn't configured on the runtime.
+
+### Runtime wiring
+
+`Runtime` gains two optional fields (`skill_ops`, `curator`), both `Some(_)` when `RuntimeConfig.skills_root` is set. Boot calls `seed_missing_history().await` before returning so on-disk files show up in the history table without a full round-trip through the proposal flow.
+
+### Verify
+
+- `cargo test -p forge-persistence -p forge-skills -p forge-runtime` → 46 pass (24 runtime + 22 skills + 0 persistence unit)
+- `cargo run -p forge-runtime --example skill_versioning_smoke` → 6 scenarios pass end-to-end (promote → promote → rollback → history assertions → retire → curator duplicate detection)
+
+### Deferred to Phase 4b
+
+- Frontend Settings > Skills tab (list, diff viewer, one-click rollback, retire, curator panel) — commands land now, UI polish comes with the next visible-user-value drop.
+- Curator auto-promotion (currently advisory only; human still runs it).
+- Postgres backend for `SkillHistoryRepository` — trait-boundary is ready.
+
+---
+
 ## Frontend surface
 
 **Stores** (`apps/forge-desktop/frontend/src/stores/`)

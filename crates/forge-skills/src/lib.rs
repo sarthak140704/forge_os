@@ -31,13 +31,18 @@ pub mod format;
 pub mod loader;
 pub mod registry;
 pub mod proposal;
+pub mod versions;
 
 pub use format::{
     parse_skill, Skill, SkillFrontMatter, SkillIo, SkillStatus, SkillTrigger,
 };
 pub use loader::{FilesystemSkillLoader, SkillLoader};
-pub use proposal::{approve_proposal, list_proposals, reject_proposal, ProposalWriter, SuggestedSkill};
+pub use proposal::{
+    approve_proposal, approve_proposal_detail, list_proposals, reject_proposal,
+    restore_from_bytes, retire_active_skill, ProposalWriter, SuggestedSkill,
+};
 pub use registry::{SkillMatch, SkillRegistry};
+pub use versions::{hash_file, SkillVersionStore};
 
 use thiserror::Error;
 

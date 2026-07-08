@@ -45,6 +45,10 @@ function summarize(e: ForgeEvent): string {
     case "mcp_server_started": return `MCP ${e.name} started (${e.tools.length} tools)`;
     case "mcp_server_failed": return `MCP ${e.name} failed: ${e.error}`;
     case "mcp_tool_invoked": return `MCP ${e.server}/${e.tool} invoked`;
+    case "skill_promoted": return `Skill promoted: ${e.name} v${e.version} (${e.sha.slice(0, 8)}, ${e.origin})`;
+    case "skill_rolled_back": return `Skill rolled back: ${e.name} → ${e.to_sha.slice(0, 8)}${e.reason ? ` (${e.reason})` : ""}`;
+    case "skill_retired": return `Skill retired: ${e.name} (${e.sha.slice(0, 8)}) — ${e.reason}`;
+    case "skill_curation_suggested": return `Curator: ${e.kind} — ${e.name} (${e.evidence})`;
     default: return JSON.stringify(e);
   }
 }

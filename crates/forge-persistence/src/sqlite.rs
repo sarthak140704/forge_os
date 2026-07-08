@@ -30,6 +30,12 @@ pub async fn connect(url: &str) -> Result<SqlitePool, PersistenceError> {
         if s.is_empty() { continue; }
         sqlx::query(s).execute(&pool).await?;
     }
+    // Phase 4a: skills_history for version-controlled learning.
+    for stmt in migrations::V002_SKILLS_HISTORY.split(';') {
+        let s = stmt.trim();
+        if s.is_empty() { continue; }
+        sqlx::query(s).execute(&pool).await?;
+    }
     Ok(pool)
 }
 
@@ -564,5 +570,113 @@ impl crate::ReflectionRepository for SqliteReflectionRepository {
             outcome:    r.try_get::<String, _>("outcome").unwrap_or_default(),
             payload:    r.try_get::<String, _>("payload").unwrap_or_default(),
         }).collect())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 4a — skills_history
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Append-only log. See `crate::SkillHistoryRepository` doc for semantics.
+// The "currently active" version of a skill is the newest row for that name
+// with `retired_at IS NULL`. Rollback = insert a new row referencing an
+// older sha. Nothing here mutates prior rows.
+
+pub struct SqliteSkillHistoryRepository { pool: SqlitePool }
+impl SqliteSkillHistoryRepository {
+    pub fn new(pool: SqlitePool) -> Self { Self { pool } }
+}
+
+fn parse_history_row(r: sqlx::sqlite::SqliteRow) -> crate::SkillVersionRecord {
+    crate::SkillVersionRecord {
+        id:                r.try_get::<i64, _>("id").unwrap_or_default(),
+        name:              r.try_get::<String, _>("name").unwrap_or_default(),
+        sha:               r.try_get::<String, _>("sha").unwrap_or_default(),
+        version:           r.try_get::<String, _>("version").unwrap_or_default(),
+        origin:            crate::SkillOrigin::parse(&r.try_get::<String, _>("origin").unwrap_or_default()),
+        origin_mission_id: r.try_get::<Option<String>, _>("origin_mission_id").unwrap_or(None),
+        parent_sha:        r.try_get::<Option<String>, _>("parent_sha").unwrap_or(None),
+        promoted_at:       r.try_get::<String, _>("promoted_at").unwrap_or_default(),
+        retired_at:        r.try_get::<Option<String>, _>("retired_at").unwrap_or(None),
+        reason:            r.try_get::<Option<String>, _>("reason").unwrap_or(None),
+    }
+}
+
+#[async_trait]
+impl crate::SkillHistoryRepository for SqliteSkillHistoryRepository {
+    async fn promote(&self, v: &crate::NewSkillVersion) -> Result<i64, PersistenceError> {
+        let res = sqlx::query(
+            "INSERT INTO skills_history (name, sha, version, origin, origin_mission_id, parent_sha, promoted_at, retired_at, reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+        )
+        .bind(&v.name)
+        .bind(&v.sha)
+        .bind(&v.version)
+        .bind(v.origin.as_str())
+        .bind(&v.origin_mission_id)
+        .bind(&v.parent_sha)
+        .bind(ts_to_str(OffsetDateTime::now_utc()))
+        .bind(&v.reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    async fn retire_active(&self, name: &str, reason: &str) -> Result<bool, PersistenceError> {
+        // Find the currently-active row (newest, retired_at IS NULL).
+        let row = sqlx::query(
+            "SELECT id FROM skills_history WHERE name=?1 AND retired_at IS NULL ORDER BY id DESC LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(false); };
+        let id: i64 = row.try_get("id")?;
+        sqlx::query(
+            "UPDATE skills_history SET retired_at=?1, reason=COALESCE(reason || '\n' || ?2, ?2) WHERE id=?3",
+        )
+        .bind(ts_to_str(OffsetDateTime::now_utc()))
+        .bind(reason)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    async fn active(&self, name: &str) -> Result<Option<crate::SkillVersionRecord>, PersistenceError> {
+        let row = sqlx::query(
+            "SELECT id, name, sha, version, origin, origin_mission_id, parent_sha, promoted_at, retired_at, reason \
+             FROM skills_history WHERE name=?1 AND retired_at IS NULL ORDER BY id DESC LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(parse_history_row))
+    }
+
+    async fn history(&self, name: &str) -> Result<Vec<crate::SkillVersionRecord>, PersistenceError> {
+        let rows = sqlx::query(
+            "SELECT id, name, sha, version, origin, origin_mission_id, parent_sha, promoted_at, retired_at, reason \
+             FROM skills_history WHERE name=?1 ORDER BY id DESC",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(parse_history_row).collect())
+    }
+
+    async fn list_active(&self) -> Result<Vec<crate::SkillVersionRecord>, PersistenceError> {
+        // Newest non-retired row per name. Uses a correlated subquery for
+        // clarity — the table is small (bounded by unique skill count).
+        let rows = sqlx::query(
+            "SELECT id, name, sha, version, origin, origin_mission_id, parent_sha, promoted_at, retired_at, reason \
+             FROM skills_history AS a \
+             WHERE retired_at IS NULL \
+               AND id = (SELECT MAX(id) FROM skills_history WHERE name = a.name AND retired_at IS NULL) \
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(parse_history_row).collect())
     }
 }
