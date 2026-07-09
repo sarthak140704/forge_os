@@ -694,10 +694,26 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
 }
 
 const SEED_SKILLS: &[(&str, &str)] = &[
-    ("rust-crate.md",     include_str!("../../../../config/skills/active/rust-crate.md")),
-    ("node-project.md",   include_str!("../../../../config/skills/active/node-project.md")),
-    ("python-project.md", include_str!("../../../../config/skills/active/python-project.md")),
-    ("git-repo.md",       include_str!("../../../../config/skills/active/git-repo.md")),
+    ("rust-crate.md",          include_str!("../../../../config/skills/active/rust-crate.md")),
+    ("node-project.md",        include_str!("../../../../config/skills/active/node-project.md")),
+    ("python-project.md",      include_str!("../../../../config/skills/active/python-project.md")),
+    ("git-repo.md",            include_str!("../../../../config/skills/active/git-repo.md")),
+    ("docker.md",              include_str!("../../../../config/skills/active/docker.md")),
+    ("kubernetes.md",          include_str!("../../../../config/skills/active/kubernetes.md")),
+    ("terraform.md",           include_str!("../../../../config/skills/active/terraform.md")),
+    ("github-cli.md",          include_str!("../../../../config/skills/active/github-cli.md")),
+    ("aws.md",                 include_str!("../../../../config/skills/active/aws.md")),
+    ("postgres.md",            include_str!("../../../../config/skills/active/postgres.md")),
+    ("redis.md",               include_str!("../../../../config/skills/active/redis.md")),
+    ("go-module.md",           include_str!("../../../../config/skills/active/go-module.md")),
+    ("react-app.md",           include_str!("../../../../config/skills/active/react-app.md")),
+    ("security-review.md",     include_str!("../../../../config/skills/active/security-review.md")),
+    ("code-review.md",         include_str!("../../../../config/skills/active/code-review.md")),
+    ("documentation.md",       include_str!("../../../../config/skills/active/documentation.md")),
+    ("refactoring.md",         include_str!("../../../../config/skills/active/refactoring.md")),
+    ("database-migration.md",  include_str!("../../../../config/skills/active/database-migration.md")),
+    ("incident-response.md",   include_str!("../../../../config/skills/active/incident-response.md")),
+    ("release-management.md",  include_str!("../../../../config/skills/active/release-management.md")),
 ];
 
 fn spawn_event_bridge(app: tauri::AppHandle, bus: EventBus) {

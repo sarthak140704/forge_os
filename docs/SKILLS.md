@@ -25,6 +25,23 @@ At runtime the desktop app resolves `{skills_root}` to
 `%APPDATA%\com.sarthak.forgeos\skills` (or the equivalent per-OS path). On
 first launch the bundled seed skills are copied in automatically.
 
+### Seed catalogue (20 skills)
+
+The bundled `active/` set (see `config/skills/active/` and `SEED_SKILLS` in the
+desktop bootstrap) covers common software-engineering domains:
+
+| Domain | Skills |
+|--------|--------|
+| Languages / build | `rust-crate`, `go-module`, `python-project`, `node-project`, `react-app` |
+| Source control | `git-repo`, `github-cli` |
+| Containers / infra | `docker`, `kubernetes`, `terraform`, `aws` |
+| Data stores | `postgres`, `redis`, `database-migration` |
+| Practices | `code-review`, `security-review`, `refactoring`, `documentation`, `release-management`, `incident-response` |
+
+Every seed skill is gated by `crates/forge-skills/tests/seed_skills.rs`, which
+asserts each one passes the hard validation checks (parses, body length, has a
+trigger, declares resolvable tools) against the built-in tool set.
+
 ## `SKILL.md` format
 
 Every skill is a Markdown file with YAML front-matter:
@@ -39,7 +56,7 @@ description: |
 triggers:
   keywords: [rust, cargo, crate, clippy, rustc]
   file_globs: ["**/Cargo.toml"]
-tools: [shell.exec, fs.read, fs.write]
+tools: [shell.run, fs.read, fs.write]
 inputs:  ["workspace_root"]
 outputs: ["build_log", "test_log"]
 ---

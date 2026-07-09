@@ -1,0 +1,118 @@
+name: CI
+
+# Cross-platform continuous integration for Forge OS.
+#
+# Gate (must pass): the Rust workspace builds and tests on Linux, macOS, and
+# Windows, and the desktop frontend builds. The Tauri desktop *crate* is
+# excluded from the Rust jobs because it needs platform WebView/GTK system
+# libraries and the Tauri CLI; it is covered by the dedicated `desktop-build`
+# job on Linux.
+#
+# Informational (non-blocking): `cargo fmt --check` and `clippy` run with
+# continue-on-error because this codebase deliberately uses compact, hand-tuned
+# formatting that canonical rustfmt would rewrite. They surface drift without
+# failing the build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: rust / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (workspace, excluding desktop)
+        run: cargo build --workspace --exclude forge-desktop --locked
+
+      - name: Test (workspace, excluding desktop)
+        run: cargo test --workspace --exclude forge-desktop --locked
+
+      - name: rustfmt (informational)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: clippy (informational)
+        continue-on-error: true
+        run: cargo clippy --workspace --exclude forge-desktop --all-targets
+
+  frontend:
+    name: frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/forge-desktop/frontend/package-lock.json
+
+      - name: Install deps
+        working-directory: apps/forge-desktop/frontend
+        run: npm ci
+
+      - name: Type-check + build
+        working-directory: apps/forge-desktop/frontend
+        run: npm run build
+
+  desktop-build:
+    name: desktop (tauri) / linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/forge-desktop/frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: apps/forge-desktop/frontend
+        run: npm ci && npm run build
+
+      - name: Cargo check the desktop crate
+        run: cargo check -p forge-desktop --locked

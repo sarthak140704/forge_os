@@ -23,7 +23,7 @@ events into a live React Flow DAG viewer.
 - **Cancellation IPC**: `cancel_mission` Tauri command emits `MissionCancelRequested` event before flipping the cooperative token. ✓ landed
 - **Skill promotion flow**: `list_skill_proposals`/`approve_skill_proposal`/`reject_skill_proposal` IPC commands moving files between `proposed/` and `active/`. ✓ landed
 - **OpenTelemetry** exporter (traces, metrics, logs). ✓ landed in Phase 6b (OTLP HTTP-protobuf, opt-in via `FORGE_OTLP_ENDPOINT`).
-- **Cross-platform** builds: macOS + Linux CI.
+- **Cross-platform** builds: macOS + Linux CI. ✓ landed (Phase 7 — `.github/workflows/ci.yml`: Rust build+test matrix on ubuntu/macos/windows, frontend build, and a Linux Tauri `cargo check` job with WebView/GTK system deps; fmt+clippy run informationally).
 - **Provider expansion**: Anthropic ✓ (Phase 6c), OpenAI ✓, Gemini ✓ (Phase 6c), Azure OpenAI ✓, LM Studio ✓, vLLM ✓ (Phase 6g).
 
 ## Phase 3 — Governance & Safety
@@ -63,3 +63,30 @@ events into a live React Flow DAG viewer.
 - Kubernetes-native orchestration
 - HA control plane
 - Anything requiring paid infra beyond a single dev's LLM API key
+
+## Phase 7 — Breadth (shipped this session)
+- **Skill library expansion**: grew the seeded skill catalogue from 4 → **20**
+  playbooks under `config/skills/active/`, covering agent.txt's Skill System +
+  Plugin catalogue: `docker`, `kubernetes`, `terraform`, `github-cli`, `aws`,
+  `postgres`, `redis`, `go-module`, `react-app`, `security-review`,
+  `code-review`, `documentation`, `refactoring`, `database-migration`,
+  `incident-response`, `release-management` (plus the original `rust-crate`,
+  `node-project`, `python-project`, `git-repo`). Each is a safety-first
+  playbook that orchestrates the domain's real CLIs through the resolvable
+  built-in tools (`fs.*`, `code.search`, `shell.run`) + `mcp:` tools. All are
+  embedded into the desktop first-run bootstrap (`SEED_SKILLS`) and gated by a
+  new portable regression test `crates/forge-skills/tests/seed_skills.rs`
+  (validates every seed skill passes the hard checks, names are unique, count
+  is stable). ✓ landed
+- **Architecture diagrams**: `docs/DIAGRAMS.md` — Mermaid diagrams closing
+  agent.txt *Deliverables* 21–27: crate dependency graph, mission + goal
+  lifecycle state machines, plan→execute→reflect sequence, event-sourcing data
+  flow, skill lifecycle, and plugin/MCP lifecycle. Grounded in the real crate
+  graph and event/state enums. ✓ landed
+- **Cross-platform CI**: see Phase 2 entry above. ✓ landed
+
+### Still deferred (need their own cadence or external infra)
+- Wasmtime skill sandbox (6d); real PostgreSQL impl (needs a live DB to verify);
+  marketplace **registry**/discovery UX (6f — signed bundles already ship);
+  API TLS + per-user auth + WebSocket; multi-user team missions + org policies;
+  Zed / JetBrains editors; voice / image / TTS / browser automation.
