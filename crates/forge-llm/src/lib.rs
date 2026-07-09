@@ -8,6 +8,7 @@ pub mod openrouter;
 pub mod openai;
 pub mod anthropic;
 pub mod gemini;
+pub mod azure_openai;
 pub mod ollama;
 pub mod groq;
 pub mod mock;

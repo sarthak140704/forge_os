@@ -768,7 +768,7 @@ cargo run -p forge-runtime --example worker_pool_smoke
 
 ```powershell
 cargo test -p forge-persistence
-# expect: 6 passed; 0 failed
+# expect: 9 passed; 0 failed
 # covers: SqliteMissionQueueRepository (idempotency, claim/finish, stale requeue)
 #         SqliteOrgMemoryRepository (insert/search/retire)
 #         postgres::connect NotYetImplemented shape
@@ -1022,7 +1022,7 @@ $b | ConvertTo-Json -Depth 10 | Set-Content $env:TEMP\my-skill.forgebundle.json
 
 ```powershell
 cargo test -p forge-cli --test end_to_end -- --nocapture
-# expect: 2 passed; 0 failed
+# expect: 5 passed; 0 failed
 #   cli_end_to_end       — spins a real Runtime, drives every route via `Command::spawn`
 #   cli_bundle_roundtrip — keygen → bundle → verify → install → tamper → verify fails
 ```
@@ -1153,7 +1153,7 @@ cargo run -p forge-runtime --example user_memory_smoke
 
 ```powershell
 cargo run -p forge-runtime --example checkpoints_headless_smoke
-# expect: PASS
+# expect: PASS: CheckpointCreated + CheckpointSkipped verified end-to-end
 ```
 
 ## TC-X-06 · Full unit + integration test regression
@@ -1257,7 +1257,7 @@ cargo run -p forge-runtime --example skill_curator_smoke
 
 ```powershell
 cargo run -p forge-runtime --example skill_curator_smoke
-# expect: 3/3 scenarios PASS
+# expect: PASS: Phase 4c curator verified end-to-end
 # Scenario 1: dry-run classifies dedupe / merge_candidate / unused correctly
 # Scenario 2: apply archives the losing duplicate, writes a merge proposal, validator OK
 # Scenario 3: 2nd pass is a no-op (idempotent)
@@ -1452,7 +1452,7 @@ Automated equivalent: `cargo test -p forge-cli --test end_to_end cli_plugin_bund
 ## TC-P6C-01 — Anthropic + Gemini response parsing (unit)
 **What:** Both adapters round-trip typical + error payloads without panicking; Anthropic hoists `role: system` into the top-level `system` field.
 **Run:** `cargo test -p forge-llm`
-**Expect:** 7 passed (2 embed, 3 anthropic, 2 gemini).
+**Expect:** 13 passed (2 embed, 3 anthropic, 2 gemini, 2 openai naming, 4 azure — see TC-P6G).
 
 ## TC-P6C-02 — Anthropic via failover chain (manual, needs `ANTHROPIC_API_KEY`)
 **What:** With no other keys set, mission planning uses Claude and produces a valid plan.
@@ -1524,3 +1524,31 @@ api_key_env = "OPENAI_API_KEY"
 Then, with the desktop app, run mission A: "This project uses pytest." — wait for reflection to persist an org-memory row and let the spawned embedder task backfill it.
 **Run:** Create mission B: "How should I check that a Python function raises the right exception?"
 **Expect:** Planner prompt includes the "pytest" org-memory row under `## Prior learnings (semantic recall)` even though "pytest" and "raises" don't share keywords. Without an embedding provider the keyword search would silently miss it.
+
+---
+
+# Phase 6g tests — provider expansion (Azure OpenAI + LM Studio + vLLM)
+
+## TC-P6G-01 — Azure OpenAI adapter (unit)
+**What:** URL is built as `{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...` (trailing slash trimmed), `api-version` override honored, typical + error payloads parse without panicking.
+**Run:** `cargo test -p forge-llm azure`
+**Expect:** 4 passed (`chat_url_*`, `api_version_override`, `parse_typical`, `parse_error`).
+
+## TC-P6G-02 — OpenAI adapter is name-configurable (unit)
+**What:** `OpenAiProvider` defaults `name()` to `openai`; `with_name(...)` overrides it so LM Studio / vLLM (OpenAI-compatible) reuse the same adapter with a distinct provider label in `CompletionResponse.provider`.
+**Run:** `cargo test -p forge-llm openai::tests`
+**Expect:** 7 passed, including `default_name_is_openai` and `with_name_overrides_for_compatible_backends`.
+
+## TC-P6G-03 — Azure via failover chain (manual, needs an Azure deployment)
+**What:** With Azure env vars set (and higher-priority keys unset), mission planning routes to the Azure deployment.
+**Prep:** Set `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT` (e.g. `https://my-res.openai.azure.com`), `AZURE_OPENAI_DEPLOYMENT` (e.g. `gpt-4o`); optional `AZURE_OPENAI_API_VERSION` (default `2024-06-01`). Restart the app.
+**Run:** Create a mission "Summarise `docs/ARCHITECTURE.md` in three bullets."
+**Expect:** Plan appears; `LlmResponded` attributes cost to the deployment name; mission completes. Provider only registers when key + endpoint + deployment are all present (else a specific warn is logged).
+
+## TC-P6G-04 — LM Studio / vLLM local backends (manual, opt-in via base env)
+**What:** Local OpenAI-compatible servers are wired only when their base env var is set, so idle machines don't get dead providers.
+**Prep (LM Studio):** start LM Studio's local server, then `LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1` (no key needed).
+**Prep (vLLM):** run vLLM's OpenAI server, then `VLLM_BASE_URL=http://127.0.0.1:8000/v1` (optional `VLLM_API_KEY`).
+**Run:** Restart the app with all cloud keys unset; create any mission.
+**Expect:** Planning succeeds against the local server; `CompletionResponse.provider` reads `lm_studio` / `vllm` respectively.
+

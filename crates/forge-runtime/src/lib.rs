@@ -273,10 +273,32 @@ pub enum LlmProviderConfig {
     OpenAi { api_key_env: String, #[serde(default)] organization_env: Option<String>, #[serde(default)] base: Option<String> },
     Anthropic { api_key_env: String, #[serde(default)] base: Option<String>, #[serde(default)] version: Option<String> },
     Gemini { api_key_env: String, #[serde(default)] base: Option<String> },
+    /// Phase 6g — Azure OpenAI. `deployment` selects the model (embedded in
+    /// the URL); `endpoint` is the resource base like
+    /// `https://my-res.openai.azure.com`. `endpoint_env` may point at an env
+    /// var instead of hard-coding the endpoint in config.
+    Azure {
+        api_key_env: String,
+        #[serde(default)] endpoint: Option<String>,
+        #[serde(default)] endpoint_env: Option<String>,
+        deployment: String,
+        #[serde(default = "default_azure_api_version")] api_version: String,
+    },
+    /// Phase 6g — LM Studio (OpenAI-compatible local server). No API key
+    /// required by default; `api_key_env` is optional for setups that
+    /// enable auth.
+    LmStudio { #[serde(default = "default_lmstudio_base")] base: String, #[serde(default)] api_key_env: Option<String> },
+    /// Phase 6g — vLLM (OpenAI-compatible server). `api_key_env` optional.
+    Vllm { #[serde(default = "default_vllm_base")] base: String, #[serde(default)] api_key_env: Option<String> },
     Groq { api_key_env: String },
     Ollama { #[serde(default = "default_ollama_base")] base: String },
 }
 fn default_ollama_base() -> String { "http://127.0.0.1:11434".to_string() }
+/// Public so downstream binaries (e.g. the Tauri desktop app) can build an
+/// `Azure` provider config without depending on `forge-llm` directly.
+pub fn default_azure_api_version() -> String { forge_llm::azure_openai::default_api_version() }
+fn default_lmstudio_base() -> String { "http://127.0.0.1:1234/v1".to_string() }
+fn default_vllm_base() -> String { "http://127.0.0.1:8000/v1".to_string() }
 
 /// Phase 6a — optional embedding provider for semantic memory recall.
 /// Absent = keyword-only recall (original 4f behaviour). When present,
@@ -487,6 +509,45 @@ impl Runtime {
                 }
                 LlmProviderConfig::Ollama { base } => {
                     providers.push(Arc::new(forge_llm::ollama::OllamaProvider::new(base.clone())));
+                }
+                LlmProviderConfig::Azure { api_key_env, endpoint, endpoint_env, deployment, api_version } => {
+                    let key = std::env::var(api_key_env).ok().filter(|k| !k.is_empty());
+                    // Endpoint may come from a literal config value or an env var.
+                    let ep = endpoint.clone().or_else(|| {
+                        endpoint_env.as_ref().and_then(|e| std::env::var(e).ok())
+                    }).filter(|e| !e.is_empty());
+                    match (key, ep) {
+                        (Some(key), Some(ep)) => {
+                            let p = forge_llm::azure_openai::AzureOpenAiProvider::new(
+                                key, ep, deployment.clone(),
+                            ).with_api_version(api_version.clone());
+                            providers.push(Arc::new(p));
+                        }
+                        (None, _) => tracing::warn!(env = %api_key_env, "Azure OpenAI API key not set; skipping"),
+                        (_, None) => tracing::warn!("Azure OpenAI endpoint not set (endpoint/endpoint_env); skipping"),
+                    }
+                }
+                LlmProviderConfig::LmStudio { base, api_key_env } => {
+                    // LM Studio needs no key by default; use a placeholder so
+                    // the Bearer header is well-formed. Honour a key env if set.
+                    let key = api_key_env.as_ref()
+                        .and_then(|e| std::env::var(e).ok())
+                        .filter(|k| !k.is_empty())
+                        .unwrap_or_else(|| "lm-studio".to_string());
+                    let p = forge_llm::openai::OpenAiProvider::new(key)
+                        .with_base(base.clone())
+                        .with_name("lmstudio");
+                    providers.push(Arc::new(p));
+                }
+                LlmProviderConfig::Vllm { base, api_key_env } => {
+                    let key = api_key_env.as_ref()
+                        .and_then(|e| std::env::var(e).ok())
+                        .filter(|k| !k.is_empty())
+                        .unwrap_or_else(|| "not-needed".to_string());
+                    let p = forge_llm::openai::OpenAiProvider::new(key)
+                        .with_base(base.clone())
+                        .with_name("vllm");
+                    providers.push(Arc::new(p));
                 }
             }
         }

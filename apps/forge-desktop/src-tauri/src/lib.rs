@@ -539,6 +539,7 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
     let anthropic_key  = forge_runtime::secrets::resolve("ANTHROPIC_API_KEY");
     let gemini_key     = forge_runtime::secrets::resolve("GEMINI_API_KEY");
     let groq_key       = forge_runtime::secrets::resolve("GROQ_API_KEY");
+    let azure_key      = forge_runtime::secrets::resolve("AZURE_OPENAI_API_KEY");
     // Bridge keyring-resolved values into env vars so the LLM providers'
     // env-based key readers pick them up transparently. `set_var` is safe
     // during boot before any thread reads these variables.
@@ -547,6 +548,7 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
     if let Some(v) = anthropic_key.as_deref()  { std::env::set_var("ANTHROPIC_API_KEY", v); }
     if let Some(v) = gemini_key.as_deref()     { std::env::set_var("GEMINI_API_KEY", v); }
     if let Some(v) = groq_key.as_deref()       { std::env::set_var("GROQ_API_KEY", v); }
+    if let Some(v) = azure_key.as_deref()      { std::env::set_var("AZURE_OPENAI_API_KEY", v); }
 
     // Failover order: OpenRouter → OpenAI → Anthropic → Gemini → Groq → Ollama.
     // First one with a key wins.
@@ -574,8 +576,37 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
             base: None,
         });
     }
+    // Phase 6g — Azure OpenAI: needs a key + endpoint + deployment. Endpoint
+    // and deployment are read from env (they aren't secrets). Only wired when
+    // all three are present.
+    let azure_endpoint   = std::env::var("AZURE_OPENAI_ENDPOINT").ok().filter(|s| !s.is_empty());
+    let azure_deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT").ok().filter(|s| !s.is_empty());
+    if azure_key.is_some() {
+        if let (Some(ep), Some(dep)) = (&azure_endpoint, &azure_deployment) {
+            providers.push(LlmProviderConfig::Azure {
+                api_key_env: "AZURE_OPENAI_API_KEY".into(),
+                endpoint: Some(ep.clone()),
+                endpoint_env: None,
+                deployment: dep.clone(),
+                api_version: std::env::var("AZURE_OPENAI_API_VERSION")
+                    .unwrap_or_else(|_| forge_runtime::default_azure_api_version()),
+            });
+        }
+    }
     if groq_key.is_some() {
         providers.push(LlmProviderConfig::Groq { api_key_env: "GROQ_API_KEY".into() });
+    }
+    // Phase 6g — local OpenAI-compatible servers, opt-in via base env vars so
+    // we don't add dead providers on machines that don't run them.
+    if let Ok(base) = std::env::var("LMSTUDIO_BASE_URL") {
+        if !base.is_empty() {
+            providers.push(LlmProviderConfig::LmStudio { base, api_key_env: None });
+        }
+    }
+    if let Ok(base) = std::env::var("VLLM_BASE_URL") {
+        if !base.is_empty() {
+            providers.push(LlmProviderConfig::Vllm { base, api_key_env: Some("VLLM_API_KEY".into()) });
+        }
     }
     providers.push(LlmProviderConfig::Ollama { base: "http://127.0.0.1:11434".into() });
 
@@ -589,6 +620,10 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
             "claude-3-5-haiku-latest".into()
         } else if gemini_key.is_some() {
             "gemini-1.5-flash".into()
+        } else if azure_key.is_some() && azure_endpoint.is_some() && azure_deployment.is_some() {
+            // Azure ignores the body model; the deployment selects it. Any
+            // non-empty string is fine — use the deployment name for clarity.
+            azure_deployment.clone().unwrap_or_else(|| "gpt-4o".into())
         } else if groq_key.is_some() {
             "llama-3.3-70b-versatile".into()
         } else {

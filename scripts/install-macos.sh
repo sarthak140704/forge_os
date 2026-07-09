@@ -169,6 +169,8 @@ Next steps:
   2. Set an LLM key, e.g.:
        export GROQ_API_KEY='<your-key>'
      Phase 6c: ANTHROPIC_API_KEY / GEMINI_API_KEY are also picked up automatically.
+     Phase 6g: Azure -> AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_DEPLOYMENT (optional AZURE_OPENAI_API_VERSION).
+     Phase 6g: local OpenAI-compatible servers -> LMSTUDIO_BASE_URL (e.g. http://127.0.0.1:1234/v1) or VLLM_BASE_URL (e.g. http://127.0.0.1:8000/v1).
   3. Boot the desktop app:
        cd apps/forge-desktop
        node ./frontend/node_modules/@tauri-apps/cli/tauri.js dev \\

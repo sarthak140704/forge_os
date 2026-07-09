@@ -79,6 +79,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // These tests mutate the process-global `FORGE_USER_MEMORY` env var, which
+    // races under cargo's parallel test runner. Serialize them with a shared
+    // lock; recover from poisoning so one panicking test doesn't cascade.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir().join(format!("forge-user-mem-{}",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -94,6 +102,7 @@ mod tests {
 
     #[test]
     fn returns_none_when_nothing_present() {
+        let _g = env_guard();
         let dir = tmp();
         std::env::remove_var("FORGE_USER_MEMORY");
         assert!(UserMemory::load(Some(&dir)).is_none());
@@ -101,6 +110,7 @@ mod tests {
 
     #[test]
     fn reads_from_app_data_dir() {
+        let _g = env_guard();
         let dir = tmp();
         write(&dir, "user.md", "prefer rust over go");
         std::env::remove_var("FORGE_USER_MEMORY");
@@ -111,6 +121,7 @@ mod tests {
 
     #[test]
     fn env_override_wins() {
+        let _g = env_guard();
         let dir = tmp();
         write(&dir, "user.md", "app data body");
         let ex = write(&dir, "explicit.md", "explicit body");
@@ -122,6 +133,7 @@ mod tests {
 
     #[test]
     fn truncates_oversized_memory() {
+        let _g = env_guard();
         let dir = tmp();
         std::env::remove_var("FORGE_USER_MEMORY");
         write(&dir, "user.md", &"y".repeat(20 * 1024));

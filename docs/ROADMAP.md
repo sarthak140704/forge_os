@@ -24,7 +24,7 @@ events into a live React Flow DAG viewer.
 - **Skill promotion flow**: `list_skill_proposals`/`approve_skill_proposal`/`reject_skill_proposal` IPC commands moving files between `proposed/` and `active/`. ✓ landed
 - **OpenTelemetry** exporter (traces, metrics, logs). ✓ landed in Phase 6b (OTLP HTTP-protobuf, opt-in via `FORGE_OTLP_ENDPOINT`).
 - **Cross-platform** builds: macOS + Linux CI.
-- **Provider expansion**: Anthropic ✓ (Phase 6c), OpenAI ✓, Gemini ✓ (Phase 6c), Azure OpenAI, LM Studio, vLLM adapters.
+- **Provider expansion**: Anthropic ✓ (Phase 6c), OpenAI ✓, Gemini ✓ (Phase 6c), Azure OpenAI ✓, LM Studio ✓, vLLM ✓ (Phase 6g).
 
 ## Phase 3 — Governance & Safety
 - **Plugin sandbox**: Wasmtime for skill code; child-process isolation for MCP servers.
@@ -55,6 +55,7 @@ events into a live React Flow DAG viewer.
 - **6b OpenTelemetry OTLP exporter**: opt-in via `FORGE_OTLP_ENDPOINT`, service name via `FORGE_OTEL_SERVICE_NAME`, HTTP-protobuf on port 4318, tokio batch runtime. Zero-cost when the env var is unset (fmt-only subscriber). Never fails boot. ✓ landed
 - **6c Anthropic + Gemini providers**: hoisted-system messages for Claude, camelCase-normalized generateContent for Gemini, prompt-based JSON mode for Anthropic, `responseMimeType` for Gemini. Auto-registered in the failover chain when keys are present. ✓ landed
 - **6e Gateway adapters — Discord + Telegram**: `/discord/interactions` with ed25519 signature verification, PING→PONG, deferred ack + async PATCH-to-webhook for slash commands; `/telegram/webhook` with optional `X-Telegram-Bot-Api-Secret-Token` check, `sendMessage` reply. ✓ landed
+- **6g Provider expansion — Azure OpenAI + LM Studio + vLLM**: dedicated `AzureOpenAiProvider` (deployment-in-URL, `api-key` header, `api-version` query param, default `2024-06-01`); LM Studio and vLLM reuse the OpenAI-compatible adapter via `OpenAiProvider::with_name(...)`. Azure registers only when key + endpoint + deployment are all present; local backends are opt-in via `LMSTUDIO_BASE_URL` / `VLLM_BASE_URL`. ✓ landed
 - **6d Wasmtime skill sandbox** — deferred (needs its own project cadence).
 - **6f Marketplace registry** — deferred (distribution + discovery UX). Signed bundles + `install-from-url` still ship in 5b/5f.
 

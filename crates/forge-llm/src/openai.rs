@@ -13,6 +13,7 @@ pub struct OpenAiProvider {
     api_key: String,
     base: String,
     organization: Option<String>,
+    name: String,
     client: reqwest::Client,
 }
 
@@ -22,6 +23,7 @@ impl OpenAiProvider {
             api_key,
             base: "https://api.openai.com/v1".to_string(),
             organization: None,
+            name: "openai".to_string(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
@@ -31,6 +33,10 @@ impl OpenAiProvider {
 
     pub fn with_base(mut self, base: impl Into<String>) -> Self { self.base = base.into(); self }
     pub fn with_organization(mut self, org: impl Into<String>) -> Self { self.organization = Some(org.into()); self }
+    /// Override the reported provider name. Used for OpenAI-compatible
+    /// backends (LM Studio, vLLM) so telemetry attributes calls to the
+    /// real backend rather than the generic "openai".
+    pub fn with_name(mut self, name: impl Into<String>) -> Self { self.name = name.into(); self }
 }
 
 #[derive(Deserialize)]
@@ -50,7 +56,7 @@ struct OaResponse {
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
-    fn name(&self) -> &str { "openai" }
+    fn name(&self) -> &str { &self.name }
 
     async fn health(&self) -> ProviderHealth {
         let url = format!("{}/models", self.base);
@@ -97,9 +103,29 @@ impl LlmProvider for OpenAiProvider {
             content,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
-            provider: "openai".to_string(),
+            provider: self.name.clone(),
             model: parsed.model.unwrap_or(req.model),
             latency_ms: start.elapsed().as_millis() as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_name_is_openai() {
+        let p = OpenAiProvider::new("k".into());
+        assert_eq!(p.name(), "openai");
+    }
+
+    #[test]
+    fn with_name_overrides_for_compatible_backends() {
+        let p = OpenAiProvider::new("not-needed".into())
+            .with_base("http://localhost:1234/v1")
+            .with_name("lmstudio");
+        assert_eq!(p.name(), "lmstudio");
+        assert_eq!(p.base, "http://localhost:1234/v1");
     }
 }

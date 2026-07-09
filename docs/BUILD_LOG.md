@@ -986,3 +986,42 @@ cargo check --workspace --tests --examples  # zero warnings
 | 6e  | `DISCORD_APPLICATION_PUBLIC_KEY` | Enables `/discord/interactions` |
 | 6e  | `TELEGRAM_BOT_TOKEN` | Enables `/telegram/webhook` |
 | 6e  | `TELEGRAM_SECRET_TOKEN` (optional) | Enforces secret-token check |
+| 6g  | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_DEPLOYMENT` | Registers Azure OpenAI provider (all three required) |
+| 6g  | `AZURE_OPENAI_API_VERSION` (optional, default `2024-06-01`) | Overrides Azure api-version |
+| 6g  | `LMSTUDIO_BASE_URL` = e.g. `http://127.0.0.1:1234/v1` | Registers LM Studio (OpenAI-compatible, no key) |
+| 6g  | `VLLM_BASE_URL` = e.g. `http://127.0.0.1:8000/v1` (optional `VLLM_API_KEY`) | Registers vLLM (OpenAI-compatible) |
+
+---
+
+## Phase 6g — Provider expansion (Azure OpenAI + LM Studio + vLLM)
+
+**Goal:** broaden the failover chain to enterprise Azure OpenAI and the two most common local OpenAI-compatible servers (LM Studio, vLLM), reusing the proven 6c adapter pattern.
+
+### `crates/forge-llm`
+- New `azure_openai.rs` — `AzureOpenAiProvider::new(api_key, endpoint, deployment)` with `with_api_version(...)` and `pub fn default_api_version() -> "2024-06-01"`. Azure's wire contract differs three ways vs. stock OpenAI: (1) the model is the *deployment name embedded in the URL path* (body `model` omitted); (2) auth is the `api-key` header, not `Authorization: Bearer`; (3) an `api-version` query param is required. URL: `{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={ver}` (trailing slash on endpoint trimmed). Response `model` falls back to the deployment for cost attribution. Health via `{endpoint}/openai/models?api-version=`. `name()` → `azure_openai`.
+- `openai.rs` — added a `name: String` field (defaults `openai`) and a `with_name(...)` builder so LM Studio / vLLM reuse this adapter with a distinct provider label. `CompletionResponse.provider` now reflects the configured name.
+- 6 new unit tests (4 Azure: URL build, api-version override, parse typical, parse error; 2 OpenAI naming). `cargo test -p forge-llm` → 13/13.
+
+### `crates/forge-runtime`
+- `LlmProviderConfig` gained `Azure { api_key_env, endpoint, endpoint_env, deployment, api_version }`, `LmStudio { base, api_key_env }`, `Vllm { base, api_key_env }` with serde defaults (`default_azure_api_version` now `pub` for the desktop binary; `default_lmstudio_base` = `http://127.0.0.1:1234/v1`; `default_vllm_base` = `http://127.0.0.1:8000/v1`).
+- `Runtime::boot` provider match got three new arms after `Ollama`. LM Studio falls back to placeholder key `lm-studio`, vLLM to `not-needed`, so `bearer_auth` is always well-formed; both honor `api_key_env` when set. Azure registers only when key + endpoint are both resolvable, else logs a specific warn.
+
+### `apps/forge-desktop`
+- `boot_runtime` bridges `AZURE_OPENAI_API_KEY` through the keyring→env path (like the other providers) and detects `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_DEPLOYMENT`, `LMSTUDIO_BASE_URL`, `VLLM_BASE_URL` to populate the `providers` vec + default-model chain. Uses `forge_runtime::default_azure_api_version()` (desktop crate has no direct `forge-llm` dep).
+
+### Drive-by fix
+- `crates/forge-runtime/src/user_memory.rs` — the four tests that mutate the process-global `FORGE_USER_MEMORY` env var raced under cargo's parallel runner (intermittent `truncates_oversized_memory` failure). Added a shared `ENV_LOCK` mutex (poison-recovering) so they serialize. `forge-runtime` lib tests now 24/24 stable.
+
+### Verification
+
+```
+cargo test -p forge-llm                     # 13/13
+cargo build -p forge-runtime                # clean
+cargo build -p forge-desktop                # clean
+cargo test --workspace                      # all green (cli 5, domain 5, gateway 8,
+                                            #   llm 13, mcp 12+3, mission 3+1, persistence 9,
+                                            #   planner 16, policy 2, runtime 24, server 8, skills 41)
+cargo check --workspace --tests --examples  # zero warnings
+```
+
+Headless example smokes (offline): skill_versioning, skill_validation, skill_curator, org_memory, checkpoints_headless, api_smoke, worker_pool, postgres_dispatch — all PASS. Live-LLM smokes (Groq): cost_summary, user_memory, episodic_recall, materialize, checkpoints_smoke — all PASS (checkpoints_smoke needed one retry after a per-minute TPM throttle).
