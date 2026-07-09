@@ -45,11 +45,11 @@ import { useUiStore } from "@/stores/ui";
 export function Settings({ onClose }: { onClose: () => void }) {
   return (
     <div
-      className="fixed inset-0 z-40 bg-black/60 flex items-center justify-center p-6"
+      className="fixed inset-0 z-40 bg-black/70 backdrop-blur-sm flex items-center justify-center p-6 animate-fade-in"
       onClick={onClose}
     >
       <div
-        className="bg-forge-bg border border-forge-border rounded-lg w-full max-w-3xl max-h-[90vh] overflow-hidden flex flex-col"
+        className="glass shadow-pop rounded-2xl w-full max-w-3xl max-h-[90vh] overflow-hidden flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         <header className="px-5 py-3 border-b border-forge-border flex items-center justify-between">
@@ -59,7 +59,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
               Governance · secrets · checkpoints · audit
             </div>
           </div>
-          <Button variant="ghost" onClick={onClose}>Close</Button>
+          <Button variant="ghost" size="sm" onClick={onClose}>Close</Button>
         </header>
 
         <div className="flex-1 overflow-y-auto p-5 space-y-6">

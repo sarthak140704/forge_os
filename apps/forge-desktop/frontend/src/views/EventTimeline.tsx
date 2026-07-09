@@ -74,6 +74,17 @@ function tone(e: ForgeEvent): string {
 
 const ALL_CATEGORIES: EventCategory[] = ["mission", "goal", "task", "llm", "plugin", "meta"];
 
+function catColor(c: EventCategory): string {
+  switch (c) {
+    case "mission": return "#7c8cf8";
+    case "goal":    return "#34d399";
+    case "task":    return "#fbbf24";
+    case "llm":     return "#a78bfa";
+    case "plugin":  return "#38bdf8";
+    default:        return "#8b93a7";
+  }
+}
+
 export function EventTimeline() {
   const events = useEventsStore((s) => s.events);
   const goalToMission = useEventsStore((s) => s.goalToMission);
@@ -113,15 +124,15 @@ export function EventTimeline() {
     <Card className="flex flex-col overflow-hidden">
       <div className="px-3 py-2 border-b border-forge-border flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <div className="text-xs uppercase tracking-wide text-forge-muted">
+          <div className="text-[11px] font-semibold uppercase tracking-wide text-forge-muted">
             Event stream
           </div>
-          <div className="text-xs text-forge-muted">
+          <div className="text-[10px] text-forge-faint tabular-nums">
             {filtered.length} / {events.length}
           </div>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <label className="text-xs text-forge-muted flex items-center gap-1 cursor-pointer">
+          <label className="text-xs text-forge-muted flex items-center gap-1.5 cursor-pointer select-none">
             <input
               type="checkbox"
               checked={showAll}
@@ -131,39 +142,46 @@ export function EventTimeline() {
             Show all missions
           </label>
           {!showAll && (
-            <span className="text-xs text-forge-muted">
-              {selectedMissionId ? `mission ${selectedMissionId.slice(0, 12)}…` : "no mission selected"}
+            <span className="text-[10px] text-forge-faint font-mono">
+              {selectedMissionId ? `${selectedMissionId.slice(0, 12)}…` : "no mission selected"}
             </span>
           )}
         </div>
         <div className="flex items-center gap-1 flex-wrap">
-          {ALL_CATEGORIES.map((c) => (
-            <button
-              key={c}
-              onClick={() => toggleCat(c)}
-              className={cn(
-                "text-[10px] uppercase px-1.5 py-0.5 rounded border transition",
-                enabledCats.has(c)
-                  ? "border-forge-accent text-forge-accent"
-                  : "border-forge-border text-forge-muted opacity-50",
-              )}
-              title={`Toggle ${c} events`}
-            >
-              {c}
-            </button>
-          ))}
+          {ALL_CATEGORIES.map((c) => {
+            const on = enabledCats.has(c);
+            return (
+              <button
+                key={c}
+                onClick={() => toggleCat(c)}
+                className={cn(
+                  "text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-full border transition-all flex items-center gap-1.5",
+                  on
+                    ? "border-forge-borderStrong bg-forge-panel2 text-forge-fg"
+                    : "border-forge-border text-forge-faint hover:text-forge-muted",
+                )}
+                title={`Toggle ${c} events`}
+              >
+                <span
+                  className="w-1.5 h-1.5 rounded-full transition-opacity"
+                  style={{ background: catColor(c), opacity: on ? 1 : 0.3 }}
+                />
+                {c}
+              </button>
+            );
+          })}
           <input
             type="text"
             placeholder="Filter…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            className="ml-auto text-xs bg-transparent border border-forge-border rounded px-1.5 py-0.5 text-forge-fg w-28 focus:w-40 transition-all outline-none focus:border-forge-accent"
+            className="ml-auto text-xs bg-forge-bg/60 border border-forge-border rounded-md px-2 py-0.5 text-forge-fg w-28 focus:w-40 transition-all outline-none focus:border-forge-accent focus:ring-2 focus:ring-forge-accent/20 placeholder:text-forge-faint"
           />
         </div>
       </div>
-      <ul className="overflow-y-auto max-h-full font-mono text-xs divide-y divide-forge-border/50">
+      <ul className="overflow-y-auto max-h-full font-mono text-xs">
         {filtered.length === 0 && (
-          <li className="px-3 py-2 text-forge-muted italic">
+          <li className="px-3 py-3 text-forge-faint italic">
             {events.length === 0
               ? "Waiting for events…"
               : missionFilter
@@ -171,17 +189,25 @@ export function EventTimeline() {
                 : "No events match the current filters."}
           </li>
         )}
-        {filtered.map((env) => (
-          <li key={env.seq} className="px-3 py-1.5 grid grid-cols-[60px_50px_1fr] gap-2">
-            <span className="text-forge-muted">#{env.seq}</span>
-            <span className="text-forge-muted text-[10px] uppercase">
-              {eventCategory(env.event)}
-            </span>
-            <span className={cn("truncate", tone(env.event))} title={summarize(env.event)}>
-              {summarize(env.event)}
-            </span>
-          </li>
-        ))}
+        {filtered.map((env) => {
+          const cat = eventCategory(env.event);
+          return (
+            <li
+              key={env.seq}
+              className="px-3 py-1.5 grid grid-cols-[46px_1fr] gap-2 items-baseline hover:bg-forge-panel2/40 transition-colors border-l-2 border-transparent hover:border-forge-border"
+            >
+              <span className="text-forge-faint tabular-nums text-[10px]">#{env.seq}</span>
+              <span className={cn("truncate flex items-center gap-2", tone(env.event))} title={summarize(env.event)}>
+                <span
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{ background: catColor(cat) }}
+                  title={cat}
+                />
+                <span className="truncate">{summarize(env.event)}</span>
+              </span>
+            </li>
+          );
+        })}
       </ul>
     </Card>
   );

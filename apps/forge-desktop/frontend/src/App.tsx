@@ -14,7 +14,8 @@ import {
 } from "@/lib/ipc";
 import { useEventsStore } from "@/stores/events";
 import { useUiStore } from "@/stores/ui";
-import { Badge, Button, Card } from "@/components/ui/primitives";
+import { Button, Card } from "@/components/ui/primitives";
+import { cn } from "@/lib/utils";
 
 export default function App() {
   const selectedId = useUiStore((s) => s.selectedMissionId);
@@ -97,23 +98,33 @@ export default function App() {
   }, []);
 
   return (
-    <div className="h-full grid grid-rows-[auto_1fr] bg-forge-bg text-forge-fg">
-      <header className="px-6 py-3 border-b border-forge-border flex items-center justify-between">
+    <div className="h-full grid grid-rows-[auto_1fr] bg-forge-radial text-forge-fg">
+      <header className="px-5 py-3 border-b border-forge-border/80 flex items-center justify-between backdrop-blur-sm">
         <div className="flex items-center gap-3">
-          <div className="w-6 h-6 rounded bg-forge-accent" />
-          <div>
-            <div className="text-base font-semibold">Forge OS</div>
-            <div className="text-xs text-forge-muted">Autonomous SWE runtime · Phase 1 vertical slice</div>
+          <div className="relative w-8 h-8 rounded-lg bg-accent-grad grid place-items-center shadow-glow">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" className="text-white">
+              <path d="M4 14l7-9v6h5l-7 9v-6H4z" fill="currentColor" />
+            </svg>
+          </div>
+          <div className="leading-tight">
+            <div className="text-[15px] font-semibold tracking-tighter2">Forge OS</div>
+            <div className="text-[11px] text-forge-muted">Autonomous SWE runtime</div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {bootError
-            ? <Badge tone="err">runtime error</Badge>
-            : ready
-              ? <Badge tone="success">runtime ready</Badge>
-              : <Badge tone="warn">reconnecting…</Badge>}
-          <Button variant="ghost" onClick={() => setShowSettings(true)} title="Settings">
-            ⚙
+        <div className="flex items-center gap-2.5">
+          <StatusPill bootError={bootError} ready={ready} />
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setShowSettings(true)}
+            title="Settings"
+            aria-label="Settings"
+            className="w-8 h-8 px-0 text-base"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
           </Button>
         </div>
       </header>
@@ -129,9 +140,7 @@ export default function App() {
         <section className="min-h-0 min-w-0 flex flex-col">
           {selectedId
             ? <MissionDagView missionId={selectedId} />
-            : <Card className="flex-1 flex items-center justify-center text-sm text-forge-muted">
-                Select a mission (or create one) to see its goal DAG.
-              </Card>}
+            : <EmptyDag />}
           {bootError && (
             <Card className="mt-3 p-3 text-xs text-forge-err whitespace-pre-wrap">
               {bootError}
@@ -144,5 +153,39 @@ export default function App() {
         </aside>
       </main>
     </div>
+  );
+}
+
+function StatusPill({ bootError, ready }: { bootError: string | null; ready: boolean }) {
+  const { label, dot, text } = bootError
+    ? { label: "runtime error", dot: "bg-forge-err", text: "text-forge-err" }
+    : ready
+      ? { label: "runtime ready", dot: "bg-forge-success", text: "text-forge-success" }
+      : { label: "reconnecting", dot: "bg-forge-warn", text: "text-forge-warn" };
+  return (
+    <span className="inline-flex items-center gap-2 pl-2 pr-2.5 py-1 rounded-full bg-forge-panel2/70 border border-forge-border text-[11px] font-medium">
+      <span className="relative flex w-2 h-2">
+        {!bootError && ready && (
+          <span className={cn("absolute inline-flex w-full h-full rounded-full opacity-60 animate-ping", dot)} />
+        )}
+        <span className={cn("relative inline-flex w-2 h-2 rounded-full", dot, !ready && !bootError && "animate-pulse-dot")} />
+      </span>
+      <span className={text}>{label}</span>
+    </span>
+  );
+}
+
+function EmptyDag() {
+  return (
+    <Card className="flex-1 flex flex-col items-center justify-center text-center gap-3 text-forge-muted">
+      <div className="w-12 h-12 rounded-xl bg-forge-panel2 border border-forge-border grid place-items-center">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" className="text-forge-faint">
+          <circle cx="6" cy="6" r="2.5" /><circle cx="18" cy="6" r="2.5" /><circle cx="12" cy="18" r="2.5" />
+          <path d="M7.7 7.7 10.5 16M16.3 7.7 13.5 16" />
+        </svg>
+      </div>
+      <div className="text-sm text-forge-fg font-medium">No mission selected</div>
+      <div className="text-xs max-w-[260px]">Create a mission or pick one from the list to watch its goal DAG plan and execute in real time.</div>
+    </Card>
   );
 }

@@ -3,12 +3,16 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Background,
   Controls,
+  Handle,
+  Position,
   ReactFlow,
   type Edge,
   type Node,
+  type NodeProps,
 } from "@xyflow/react";
 import { getMission, cancelMission, extendMission } from "@/lib/ipc";
-import { Card } from "@/components/ui/primitives";
+import { Badge, Button, Card } from "@/components/ui/primitives";
+import { cn } from "@/lib/utils";
 import type { Goal, GoalStatus, MissionDetail, MissionStatus } from "@/lib/events";
 
 function statusColor(s: GoalStatus): string {
@@ -18,7 +22,48 @@ function statusColor(s: GoalStatus): string {
     case "failed":    return "#f87171";
     case "skipped":   return "#8b93a7";
     case "ready":     return "#fbbf24";
-    default:          return "#232732";
+    default:          return "#5b6273";
+  }
+}
+
+type GoalNodeData = { title: string; status: GoalStatus };
+
+function GoalNode({ data }: NodeProps) {
+  const { title, status } = data as GoalNodeData;
+  const color = statusColor(status);
+  const running = status === "running";
+  return (
+    <div
+      className="w-[200px] rounded-xl border bg-forge-panel/95 shadow-card px-3 py-2.5 transition-shadow"
+      style={{ borderColor: running ? color : "#222634", boxShadow: running ? `0 0 0 1px ${color}55, 0 0 22px -8px ${color}` : undefined }}
+    >
+      <Handle type="target" position={Position.Top} />
+      <div className="flex items-start gap-2">
+        <span
+          className={cn("mt-1 w-2 h-2 rounded-full shrink-0", running && "animate-pulse-dot")}
+          style={{ background: color, boxShadow: `0 0 8px ${color}` }}
+        />
+        <div className="min-w-0">
+          <div className="text-[12px] font-medium text-forge-fg leading-snug line-clamp-2">{title}</div>
+          <div className="mt-0.5 text-[10px] uppercase tracking-wide" style={{ color }}>{status}</div>
+        </div>
+      </div>
+      <Handle type="source" position={Position.Bottom} />
+    </div>
+  );
+}
+
+const nodeTypes = { goal: GoalNode };
+
+function missionTone(s: MissionStatus): "default" | "success" | "warn" | "err" | "info" {
+  switch (s) {
+    case "completed": return "success";
+    case "failed":
+    case "cancelled": return "err";
+    case "running":
+    case "planning": return "info";
+    case "paused": return "warn";
+    default: return "default";
   }
 }
 
@@ -43,23 +88,14 @@ function buildGraph(detail: MissionDetail): { nodes: Node[]; edges: Edge[] } {
   goals.forEach((g) => lvl(g.id));
   const columns = new Map<number, number>();
   const nodes: Node[] = goals.map((g) => {
-    const y = (level.get(g.id) ?? 0) * 140;
+    const y = (level.get(g.id) ?? 0) * 150;
     const col = columns.get(level.get(g.id) ?? 0) ?? 0;
     columns.set(level.get(g.id) ?? 0, col + 1);
     return {
       id: g.id,
-      position: { x: col * 240, y },
-      data: { label: `${g.title}\n(${g.status})` },
-      style: {
-        background: "#12151d",
-        color: "#e5e7eb",
-        border: `2px solid ${statusColor(g.status)}`,
-        borderRadius: 8,
-        padding: 8,
-        fontSize: 12,
-        whiteSpace: "pre-line",
-        width: 200,
-      },
+      type: "goal",
+      position: { x: col * 250, y },
+      data: { title: g.title, status: g.status },
     };
   });
   const edges: Edge[] = goals.flatMap((g) =>
@@ -68,7 +104,7 @@ function buildGraph(detail: MissionDetail): { nodes: Node[]; edges: Edge[] } {
       source: dep,
       target: g.id,
       animated: g.status === "running",
-      style: { stroke: "#8b93a7" },
+      style: { stroke: "#3a4152" },
     }))
   );
   return { nodes, edges };
@@ -120,34 +156,37 @@ export function MissionDagView({ missionId }: { missionId: string }) {
           <div className="text-xs text-forge-muted truncate">{data.mission.description}</div>
         </div>
         <div className="flex items-center gap-2 text-xs">
-          <span className="text-forge-muted whitespace-nowrap">
+          <Badge tone={missionTone(status)} dot>{status}</Badge>
+          <span className="text-forge-muted whitespace-nowrap tabular-nums">
             {data.goals.length} goals · {Object.values(data.tasks_by_goal).flat().length} tasks
           </span>
           {cancellable && (
-            <button
+            <Button
+              size="sm"
+              variant="danger"
               onClick={() => cancel.mutate()}
               disabled={cancel.isPending}
-              className="px-2 py-1 rounded border border-forge-err text-forge-err hover:bg-forge-err hover:text-forge-bg transition disabled:opacity-50"
               title="Cancel this mission"
             >
               {cancel.isPending ? "Cancelling…" : "Cancel"}
-            </button>
+            </Button>
           )}
           {extendable && (
-            <button
+            <Button
+              size="sm"
+              variant={showFollowUp ? "subtle" : "secondary"}
               onClick={() => setShowFollowUp((v) => !v)}
-              className="px-2 py-1 rounded border border-forge-accent text-forge-accent hover:bg-forge-accent hover:text-forge-bg transition"
               title="Add a follow-up prompt to this mission"
             >
-              {showFollowUp ? "Cancel" : "+ Follow-up"}
-            </button>
+              {showFollowUp ? "Close" : "+ Follow-up"}
+            </Button>
           )}
         </div>
       </div>
       {showFollowUp && extendable && (
-        <div className="px-4 py-3 border-b border-forge-border bg-forge-card/50 flex flex-col gap-2">
+        <div className="px-4 py-3 border-b border-forge-border bg-forge-panel2/60 flex flex-col gap-2">
           <textarea
-            className="w-full min-h-[70px] bg-forge-bg border border-forge-border rounded px-2 py-1 text-sm text-forge-fg placeholder:text-forge-muted focus:border-forge-accent outline-none resize-y"
+            className="w-full min-h-[70px] bg-forge-bg border border-forge-border rounded-lg px-3 py-2 text-sm text-forge-fg placeholder:text-forge-faint focus:border-forge-accent focus:ring-2 focus:ring-forge-accent/25 outline-none resize-y transition"
             placeholder="What should this mission also do? e.g. 'now also write a README'"
             value={followUp}
             onChange={(e) => setFollowUp(e.target.value)}
@@ -160,13 +199,13 @@ export function MissionDagView({ missionId }: { missionId: string }) {
                 {String((extend.error as Error).message ?? extend.error)}
               </span>
             )}
-            <button
+            <Button
+              size="sm"
               onClick={() => extend.mutate(followUp)}
               disabled={extend.isPending || !followUp.trim()}
-              className="px-3 py-1 rounded bg-forge-accent text-forge-bg text-xs font-medium hover:opacity-90 transition disabled:opacity-50"
             >
               {extend.isPending ? "Extending…" : "Extend mission"}
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -174,13 +213,14 @@ export function MissionDagView({ missionId }: { missionId: string }) {
         <ReactFlow
           nodes={nodes}
           edges={edges}
+          nodeTypes={nodeTypes}
           fitView
           fitViewOptions={{ padding: 0.2 }}
           minZoom={0.2}
           maxZoom={2}
           proOptions={{ hideAttribution: true }}
         >
-          <Background gap={20} color="#1a1e28" />
+          <Background gap={22} size={1} color="#1a1e28" />
           <Controls
             position="bottom-left"
             showInteractive={false}

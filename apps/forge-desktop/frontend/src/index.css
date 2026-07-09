@@ -6,24 +6,54 @@
 @tailwind components;
 @tailwind utilities;
 
-html, body, #root { height: 100%; margin: 0; }
+@layer base {
+  html, body, #root { height: 100%; margin: 0; }
+
+  body {
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    /* Subtle ambient glow behind the whole app. */
+    background-color: #0a0c11;
+    background-image:
+      radial-gradient(1200px 600px at 18% -12%, rgba(124, 140, 248, 0.08), transparent 60%),
+      radial-gradient(900px 520px at 100% -6%, rgba(167, 139, 250, 0.06), transparent 55%);
+    background-attachment: fixed;
+  }
+
+  ::selection { background: rgba(124, 140, 248, 0.28); }
+
+  :focus-visible { outline: none; }
+}
+
+@layer components {
+  /* Frosted panel used by modals / overlays. */
+  .glass {
+    background: rgba(18, 21, 29, 0.82);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+  }
+}
 
 ::-webkit-scrollbar        { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb  { background: #232732; border-radius: 6px; }
+::-webkit-scrollbar-thumb  { background: #232732; border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-track  { background: transparent; }
-::-webkit-scrollbar-thumb:hover { background: #2f3542; }
+::-webkit-scrollbar-thumb:hover { background: #333a4a; background-clip: padding-box; }
 
 /* React Flow overrides — the default controls are barely visible on
- * dark backgrounds. */
+ * dark backgrounds, and the base nodes need to match our surfaces. */
 .forge-flow .react-flow__controls {
   overflow: hidden;
+  border-radius: 10px;
+  box-shadow: 0 12px 40px -12px rgba(0, 0, 0, 0.7);
 }
 .forge-flow .react-flow__controls-button {
   background: #12151d !important;
   color: #e5e7eb !important;
-  border-color: #232732 !important;
-  border-bottom: 1px solid #232732 !important;
+  border-color: #222634 !important;
+  border-bottom: 1px solid #222634 !important;
   fill: #e5e7eb !important;
+  transition: background 140ms ease;
 }
 .forge-flow .react-flow__controls-button:hover {
   background: #1a1e28 !important;
@@ -33,13 +63,18 @@ html, body, #root { height: 100%; margin: 0; }
   max-width: 12px;
   max-height: 12px;
 }
-.forge-flow .react-flow__background {
-  background: #0b0d12;
-}
+.forge-flow .react-flow__background { background: transparent; }
 .forge-flow .react-flow__edge-path {
-  stroke: #4b5364;
+  stroke: #3a4152;
   stroke-width: 1.5;
 }
 .forge-flow .react-flow__edge.animated .react-flow__edge-path {
   stroke: #7c8cf8;
+  stroke-width: 2;
+}
+.forge-flow .react-flow__handle {
+  width: 6px;
+  height: 6px;
+  background: #4b5364;
+  border: none;
 }

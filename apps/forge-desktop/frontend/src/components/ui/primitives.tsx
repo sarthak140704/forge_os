@@ -1,24 +1,39 @@
 import { cn } from "@/lib/utils";
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from "react";
 
 export function Button({
   children,
   className,
   variant = "primary",
+  size = "md",
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: "primary" | "ghost" | "danger";
+  variant?: "primary" | "secondary" | "ghost" | "danger" | "subtle";
+  size?: "sm" | "md";
   children: ReactNode;
 }) {
   const base =
-    "px-3 py-1.5 rounded-md text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed";
+    "inline-flex items-center justify-center gap-1.5 rounded-md font-medium transition-all " +
+    "outline-none focus-visible:ring-2 focus-visible:ring-forge-accent/60 " +
+    "active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100";
+  const sizes = {
+    sm: "px-2.5 py-1 text-xs",
+    md: "px-3 py-1.5 text-sm",
+  }[size];
   const styles = {
-    primary: "bg-forge-accent/90 hover:bg-forge-accent text-white",
-    ghost: "text-forge-muted hover:text-forge-fg hover:bg-forge-panel",
-    danger: "bg-forge-err/80 hover:bg-forge-err text-white",
+    primary:
+      "bg-accent-grad text-white shadow-sm hover:brightness-110 hover:shadow-glow",
+    secondary:
+      "bg-forge-panel2 text-forge-fg border border-forge-border hover:border-forge-borderStrong hover:bg-forge-panel",
+    ghost:
+      "text-forge-muted hover:text-forge-fg hover:bg-forge-panel2",
+    subtle:
+      "bg-forge-panel2/60 text-forge-muted hover:text-forge-fg hover:bg-forge-panel2",
+    danger:
+      "bg-forge-err/90 hover:bg-forge-err text-white shadow-sm",
   }[variant];
   return (
-    <button className={cn(base, styles, className)} {...rest}>
+    <button className={cn(base, sizes, styles, className)} {...rest}>
       {children}
     </button>
   );
@@ -27,16 +42,20 @@ export function Button({
 export function Card({
   children,
   className,
-}: {
+  hover = false,
+  ...rest
+}: HTMLAttributes<HTMLDivElement> & {
   children: ReactNode;
-  className?: string;
+  hover?: boolean;
 }) {
   return (
     <div
       className={cn(
-        "bg-forge-panel border border-forge-border rounded-lg",
+        "bg-forge-panel/90 border border-forge-border rounded-xl shadow-card",
+        hover && "transition-colors hover:border-forge-borderStrong",
         className
       )}
+      {...rest}
     >
       {children}
     </div>
@@ -46,24 +65,34 @@ export function Card({
 export function Badge({
   children,
   tone = "default",
+  dot = false,
 }: {
   children: ReactNode;
   tone?: "default" | "success" | "warn" | "err" | "info";
+  dot?: boolean;
 }) {
   const style = {
-    default: "bg-forge-border text-forge-muted",
-    success: "bg-forge-success/20 text-forge-success",
-    warn: "bg-forge-warn/20 text-forge-warn",
-    err: "bg-forge-err/20 text-forge-err",
-    info: "bg-forge-accent/20 text-forge-accent",
+    default: "bg-forge-panel2 text-forge-muted ring-1 ring-inset ring-forge-border",
+    success: "bg-forge-success/12 text-forge-success ring-1 ring-inset ring-forge-success/25",
+    warn: "bg-forge-warn/12 text-forge-warn ring-1 ring-inset ring-forge-warn/25",
+    err: "bg-forge-err/12 text-forge-err ring-1 ring-inset ring-forge-err/25",
+    info: "bg-forge-accent/12 text-forge-accent ring-1 ring-inset ring-forge-accent/25",
+  }[tone];
+  const dotColor = {
+    default: "bg-forge-faint",
+    success: "bg-forge-success",
+    warn: "bg-forge-warn",
+    err: "bg-forge-err",
+    info: "bg-forge-accent",
   }[tone];
   return (
     <span
       className={cn(
-        "px-2 py-0.5 rounded text-xs font-medium uppercase tracking-wide",
+        "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wide",
         style
       )}
     >
+      {dot && <span className={cn("w-1.5 h-1.5 rounded-full", dotColor)} />}
       {children}
     </span>
   );
