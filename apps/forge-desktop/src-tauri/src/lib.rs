@@ -536,15 +536,20 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
 
     let openrouter_key = forge_runtime::secrets::resolve("OPENROUTER_API_KEY");
     let openai_key     = forge_runtime::secrets::resolve("OPENAI_API_KEY");
+    let anthropic_key  = forge_runtime::secrets::resolve("ANTHROPIC_API_KEY");
+    let gemini_key     = forge_runtime::secrets::resolve("GEMINI_API_KEY");
     let groq_key       = forge_runtime::secrets::resolve("GROQ_API_KEY");
     // Bridge keyring-resolved values into env vars so the LLM providers'
     // env-based key readers pick them up transparently. `set_var` is safe
     // during boot before any thread reads these variables.
     if let Some(v) = openrouter_key.as_deref() { std::env::set_var("OPENROUTER_API_KEY", v); }
     if let Some(v) = openai_key.as_deref()     { std::env::set_var("OPENAI_API_KEY", v); }
+    if let Some(v) = anthropic_key.as_deref()  { std::env::set_var("ANTHROPIC_API_KEY", v); }
+    if let Some(v) = gemini_key.as_deref()     { std::env::set_var("GEMINI_API_KEY", v); }
     if let Some(v) = groq_key.as_deref()       { std::env::set_var("GROQ_API_KEY", v); }
 
-    // Failover order: OpenRouter → OpenAI → Groq → Ollama. First one with a key wins.
+    // Failover order: OpenRouter → OpenAI → Anthropic → Gemini → Groq → Ollama.
+    // First one with a key wins.
     let mut providers: Vec<LlmProviderConfig> = Vec::new();
     if openrouter_key.is_some() {
         providers.push(LlmProviderConfig::OpenRouter { api_key_env: "OPENROUTER_API_KEY".into() });
@@ -553,6 +558,19 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         providers.push(LlmProviderConfig::OpenAi {
             api_key_env: "OPENAI_API_KEY".into(),
             organization_env: Some("OPENAI_ORG_ID".into()),
+            base: None,
+        });
+    }
+    if anthropic_key.is_some() {
+        providers.push(LlmProviderConfig::Anthropic {
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            base: None,
+            version: None,
+        });
+    }
+    if gemini_key.is_some() {
+        providers.push(LlmProviderConfig::Gemini {
+            api_key_env: "GEMINI_API_KEY".into(),
             base: None,
         });
     }
@@ -567,6 +585,10 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
             "openai/gpt-4o-mini".into()
         } else if openai_key.is_some() {
             "gpt-4o-mini".into()
+        } else if anthropic_key.is_some() {
+            "claude-3-5-haiku-latest".into()
+        } else if gemini_key.is_some() {
+            "gemini-1.5-flash".into()
         } else if groq_key.is_some() {
             "llama-3.3-70b-versatile".into()
         } else {
@@ -590,6 +612,7 @@ async fn boot_runtime(app: &tauri::AppHandle) -> anyhow::Result<Arc<AppState>> {
         workers: 2,
         worker_stale_secs: 120,
         org_memory_enabled: true,
+        embedding_provider: None,
         api_bind: Some("127.0.0.1:7823".parse().unwrap()),
         api_token_env: "FORGE_API_TOKEN".to_string(),
     };

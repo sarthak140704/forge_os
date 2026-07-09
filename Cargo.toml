@@ -46,6 +46,13 @@ anyhow           = "1"
 tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
+# OpenTelemetry (optional, activated by FORGE_OTLP_ENDPOINT at runtime).
+# Version pinned as a compatible set — do not bump individually.
+opentelemetry         = { version = "0.24", default-features = false, features = ["trace"] }
+opentelemetry_sdk     = { version = "0.24", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp    = { version = "0.17", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "0.25", default-features = false }
+
 # persistence
 sqlx             = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 

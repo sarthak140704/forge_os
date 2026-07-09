@@ -908,3 +908,81 @@ cd apps/forge-desktop/frontend; npx tsc --noEmit
 - **No `sqlite3` CLI on default Windows** — use Python `sqlite3` module (see `scripts/*.py`).
 - **Tauri launch** — always from `apps/forge-desktop` running `node .\frontend\node_modules\@tauri-apps\cli\tauri.js dev --config .\src-tauri\tauri.conf.json`. `cargo tauri dev` and `npm run tauri` variants have proven flaky.
 - **PowerShell fresh-process PATH** — each `powershell(...)` call needs `$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User');` prefix.
+
+
+---
+
+## Phase 6 — Depth (shipped this session)
+
+Four parallel tracks (**6a semantic memory**, **6b OpenTelemetry**, **6c Anthropic + Gemini providers**, **6e Discord + Telegram gateway adapters**) landed in one push. **6d Wasmtime sandbox** and **6f marketplace registry** deferred — 6d needs its own project cadence and 6f is a distribution/UX problem the signed-bundle work in 5b/5f already solved on the artefact side.
+
+### 6a Semantic memory
+
+- `V005_SEMANTIC_MEMORY` migration adds `embedding BLOB` + `embedding_dim INTEGER` (both nullable) to `org_memory`. Runner tolerates the "duplicate column" error on second boot so it stays idempotent.
+- `EmbeddingProvider` trait added in `forge-llm/src/lib.rs` with `name()`, `dim()`, `embed(text) -> Vec<f32>`.
+- Two adapters:
+  - `embed_openai.rs` — `POST /v1/embeddings`, model `text-embedding-3-small` (dim 1536) by default; convenience constructors for `.small()` / `.large()`.
+  - `embed_ollama.rs` — `POST /api/embeddings`, model `nomic-embed-text` (dim 768) by default.
+- Persistence: `OrgMemoryRow.embedding: Option<Vec<f32>>`, `NewOrgMemory.embedding: Option<Vec<f32>>`, `semantic_search(query, limit) -> Vec<(cos, row)>`, `set_embedding(id, &[f32])` for lazy backfill. Bytes stored little-endian; cosine computed in Rust after a dim-filtered SQLite scan.
+- `MissionService.embedding_provider: Option<Arc<dyn EmbeddingProvider>>` + `fetch_org_memory_block` prefers semantic (min cosine 0.20) and falls back to keyword LIKE.
+- Freshly-written insight rows get their embedding backfilled in a spawned task — failures never affect the mission.
+- Runtime config gate: new `embedding_provider: Option<EmbeddingProviderConfig>` (OpenAi/Ollama variants). `None` = keyword-only recall (original 4f behaviour).
+- Unit tests: 3 new persistence tests (cosine ranking, dim mismatch skip, backfill+retire) + 2 embedder tests. All green.
+
+### 6b OpenTelemetry OTLP exporter
+
+- Deps pinned as one unit — do not bump individually: `opentelemetry 0.24`, `opentelemetry_sdk 0.24` (feat `trace` + `rt-tokio`), `opentelemetry-otlp 0.17` (feat `trace` + `http-proto` + `reqwest-blocking-client`), `tracing-opentelemetry 0.25`.
+- `install_tracing_default()` in `forge-runtime/src/lib.rs` becomes OTel-aware: fast-path fmt-only when `FORGE_OTLP_ENDPOINT` is unset, exports to OTLP HTTP-protobuf (port 4318) when set.
+- Endpoint auto-suffixes `/v1/traces` if missing so `http://localhost:4318` works out of the box.
+- Service name from `FORGE_OTEL_SERVICE_NAME` (default `forge-runtime`).
+- **Critical:** `OpenTelemetryLayer<Registry, Tracer>` only impls `Layer<Registry>`, so it MUST be applied first: `registry().with(otel_layer).with(env_filter).with(fmt::layer())`. Wrong order gives an inscrutable `SubscriberInitExt` bound error. In-code comment left explaining this.
+- Batch span exporter runs on the tokio scheduler (`opentelemetry_sdk::runtime::Tokio`). OTel init failure gracefully falls back to fmt-only — never fails boot.
+
+### 6c Anthropic + Gemini providers
+
+- `anthropic.rs`: `POST /v1/messages`, hoists `role: system` messages into top-level `system`, `max_tokens` defaults to 4096 (required by Anthropic), auth via `x-api-key` + `anthropic-version: 2023-06-01`. JSON mode injects a system nudge — Anthropic has no structured-output flag.
+- `gemini.rs`: `POST models/{model}:generateContent?key=...`, normalizes `assistant` → `model` role, hoists system into `systemInstruction`, **struct-level `#[serde(rename_all = "camelCase")]`** on the response type (initial bug: `Option::unwrap` on `None` because `finishReason` decoded to snake_case). JSON mode via `generationConfig.responseMimeType: "application/json"`.
+- Both registered in `LlmProviderConfig` and picked up in `Runtime::boot`'s provider chain and in `apps/forge-desktop/src-tauri/src/lib.rs`'s bootstrap.
+- Failover order (all opt-in via env vars): OpenRouter → OpenAI → Anthropic → Gemini → Groq → Ollama. First registered wins the default model choice (`claude-3-5-haiku-latest`, `gemini-1.5-flash`).
+- 5 unit tests (Anthropic: parse typical, parse error, hoists system; Gemini: parse typical, parse error). All green.
+
+### 6e Discord + Telegram gateway adapters
+
+- `apps/forge-gateway`: `ed25519-dalek = { workspace = true }` added; `Cli` gets `--discord-public-key`, `--telegram-bot-token`, `--telegram-secret-token` flags; `AppState` extended; two new routes registered.
+- `/discord/interactions`:
+  - ed25519 signature verification over `X-Signature-Timestamp || body`. Public key hex-decoded to `[u8; 32]`, sig to `[u8; 64]`.
+  - PING (type=1) → `{ "type": 1 }` PONG.
+  - APPLICATION_COMMAND (type=2) → immediate `{ "type": 5 }` deferred ack, then `tokio::spawn` runs the upstream Forge call and `PATCH https://discord.com/api/v10/webhooks/{app_id}/{token}/messages/@original` with the reply.
+  - `extract_discord_command_text` picks the first STRING option (type=3), else falls back to the command name.
+  - Returns 404 when `DISCORD_APPLICATION_PUBLIC_KEY` is empty.
+- `/telegram/webhook`:
+  - Accepts raw `Json<serde_json::Value>` (Telegram Update schema).
+  - Optional `X-Telegram-Bot-Api-Secret-Token` check when `TELEGRAM_SECRET_TOKEN` is set (matches Bot API `setWebhook` secret_token param).
+  - Extracts `message.chat.id` + `message.text`; non-message updates (edited_message, channel_post, callback_query) drop with 200 OK.
+  - Reply via `POST https://api.telegram.org/bot{token}/sendMessage`.
+  - Returns 404 when the bot token is empty.
+- 4 new gateway tests (Discord sig verify, tampered-body rejection, string-option extraction, command-name fallback). All 8 gateway tests pass.
+
+### Verification
+
+```
+cargo test -p forge-llm         # 7/7 (2 embed, 3 anthropic, 2 gemini)
+cargo test -p forge-persistence # 9/9 (3 new semantic-memory tests)
+cargo test -p forge-gateway     # 8/8 (4 slack, 3 discord, 1 build_router)
+cargo test --workspace --lib    # all green
+cargo check --workspace --tests --examples  # zero warnings
+```
+
+### Env-var summary (opt-in for every 6x track)
+
+| Track | Env var | Effect |
+|---|---|---|
+| 6a  | `EMBEDDING_PROVIDER` = `openai`/`ollama` (via config `embedding_provider = { kind = ... }`) | Enables semantic recall |
+| 6a  | `OPENAI_API_KEY` (when kind=`openai`) | Needed for OpenAI embedder |
+| 6b  | `FORGE_OTLP_ENDPOINT` = e.g. `http://localhost:4318` | Enables OTLP export |
+| 6b  | `FORGE_OTEL_SERVICE_NAME` (default `forge-runtime`) | Overrides service.name |
+| 6c  | `ANTHROPIC_API_KEY` | Registers Anthropic provider |
+| 6c  | `GEMINI_API_KEY` | Registers Gemini provider |
+| 6e  | `DISCORD_APPLICATION_PUBLIC_KEY` | Enables `/discord/interactions` |
+| 6e  | `TELEGRAM_BOT_TOKEN` | Enables `/telegram/webhook` |
+| 6e  | `TELEGRAM_SECRET_TOKEN` (optional) | Enforces secret-token check |

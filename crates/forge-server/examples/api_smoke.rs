@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers: 0,
         worker_stale_secs: 120,
         org_memory_enabled: false,
+        embedding_provider: None,
         api_bind: Some(bind),
         api_token_env: "FORGE_SMOKE_TOKEN".into(),
     };

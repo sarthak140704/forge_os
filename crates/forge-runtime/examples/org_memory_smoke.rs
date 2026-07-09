@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers: 0,
         worker_stale_secs: 60,
         org_memory_enabled: true,
+        embedding_provider: None,
         api_bind: None,
         api_token_env: String::new(),
     };
@@ -69,18 +70,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         value: "Rust projects with multiple crates should use a top-level Cargo workspace.".into(),
         tags: vec!["rust".into(), "workspace".into()],
         source_mission_id: Some(mid),
+        embedding: None,
     }).await?;
     let id2 = runtime.org_memory.insert(&NewOrgMemory {
         key:  "always-run-cargo-fmt".into(),
         value: "Format every Rust change with cargo fmt before commit.".into(),
         tags: vec!["rust".into(), "fmt".into()],
         source_mission_id: Some(mid),
+        embedding: None,
     }).await?;
     let id3 = runtime.org_memory.insert(&NewOrgMemory {
         key:  "python-uses-uv".into(),
         value: "Prefer uv over pip/poetry for Python dependency management.".into(),
         tags: vec!["python".into(), "uv".into()],
         source_mission_id: Some(mid),
+        embedding: None,
     }).await?;
     println!("  ✓ inserted #{id1} #{id2} #{id3}");
 

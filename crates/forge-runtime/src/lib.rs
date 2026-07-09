@@ -227,6 +227,13 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub org_memory_enabled: bool,
 
+    /// Phase 6a — embedding provider. When set, the mission service
+    /// embeds each recall query and each new memory row so recall
+    /// scales to nuance the keyword search can't match. `None` keeps
+    /// the original keyword-only behaviour.
+    #[serde(default)]
+    pub embedding_provider: Option<EmbeddingProviderConfig>,
+
     /// Phase 5 — HTTP API server. If `Some(addr)`, `Runtime::boot`
     /// spawns an axum server bound to `addr` exposing REST + SSE +
     /// OpenAI-compat endpoints. Defaults to `None` (server disabled).
@@ -264,10 +271,36 @@ pub struct LlmConfig {
 pub enum LlmProviderConfig {
     OpenRouter { api_key_env: String },
     OpenAi { api_key_env: String, #[serde(default)] organization_env: Option<String>, #[serde(default)] base: Option<String> },
+    Anthropic { api_key_env: String, #[serde(default)] base: Option<String>, #[serde(default)] version: Option<String> },
+    Gemini { api_key_env: String, #[serde(default)] base: Option<String> },
     Groq { api_key_env: String },
     Ollama { #[serde(default = "default_ollama_base")] base: String },
 }
 fn default_ollama_base() -> String { "http://127.0.0.1:11434".to_string() }
+
+/// Phase 6a — optional embedding provider for semantic memory recall.
+/// Absent = keyword-only recall (original 4f behaviour). When present,
+/// the mission service embeds each recall query and each freshly-written
+/// memory row and ranks by cosine similarity.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EmbeddingProviderConfig {
+    OpenAi {
+        api_key_env: String,
+        #[serde(default)] base: Option<String>,
+        #[serde(default = "default_openai_embed_model")] model: String,
+        #[serde(default = "default_openai_embed_dim")] dim: usize,
+    },
+    Ollama {
+        #[serde(default = "default_ollama_base")] base: String,
+        #[serde(default = "default_ollama_embed_model")] model: String,
+        #[serde(default = "default_ollama_embed_dim")] dim: usize,
+    },
+}
+fn default_openai_embed_model() -> String { "text-embedding-3-small".to_string() }
+fn default_openai_embed_dim()   -> usize  { 1536 }
+fn default_ollama_embed_model() -> String { "nomic-embed-text".to_string() }
+fn default_ollama_embed_dim()   -> usize  { 768 }
 
 impl RuntimeConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, RuntimeError> {
@@ -431,6 +464,27 @@ impl Runtime {
                         _ => tracing::warn!(env = %api_key_env, "Groq API key not set; skipping"),
                     }
                 }
+                LlmProviderConfig::Anthropic { api_key_env, base, version } => {
+                    match std::env::var(api_key_env) {
+                        Ok(key) if !key.is_empty() => {
+                            let mut p = forge_llm::anthropic::AnthropicProvider::new(key);
+                            if let Some(b) = base    { p = p.with_base(b.clone()); }
+                            if let Some(v) = version { p = p.with_version(v.clone()); }
+                            providers.push(Arc::new(p));
+                        }
+                        _ => tracing::warn!(env = %api_key_env, "Anthropic API key not set; skipping"),
+                    }
+                }
+                LlmProviderConfig::Gemini { api_key_env, base } => {
+                    match std::env::var(api_key_env) {
+                        Ok(key) if !key.is_empty() => {
+                            let mut p = forge_llm::gemini::GeminiProvider::new(key);
+                            if let Some(b) = base { p = p.with_base(b.clone()); }
+                            providers.push(Arc::new(p));
+                        }
+                        _ => tracing::warn!(env = %api_key_env, "Gemini API key not set; skipping"),
+                    }
+                }
                 LlmProviderConfig::Ollama { base } => {
                     providers.push(Arc::new(forge_llm::ollama::OllamaProvider::new(base.clone())));
                 }
@@ -535,6 +589,38 @@ impl Runtime {
                 }))
             } else { None };
 
+        // Phase 6a — embedding provider (semantic memory recall).
+        // Config-driven so users can pick OpenAI (paid, high quality) or
+        // Ollama (free, local). `None` keeps keyword-only recall.
+        let embedder: Option<Arc<dyn forge_llm::EmbeddingProvider>> =
+            match &config.embedding_provider {
+                None => None,
+                Some(EmbeddingProviderConfig::OpenAi { api_key_env, base, model, dim }) => {
+                    match std::env::var(api_key_env) {
+                        Ok(key) if !key.is_empty() => {
+                            tracing::info!(
+                                model, dim,
+                                "wiring OpenAI embedding provider for semantic memory"
+                            );
+                            Some(Arc::new(forge_llm::embed_openai::OpenAiEmbeddingProvider::new(
+                                key, base.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+                                model.clone(), *dim,
+                            )))
+                        }
+                        _ => {
+                            tracing::warn!(env = %api_key_env, "OpenAI embedding key env unset; semantic memory disabled");
+                            None
+                        }
+                    }
+                }
+                Some(EmbeddingProviderConfig::Ollama { base, model, dim }) => {
+                    tracing::info!(model, dim, base, "wiring Ollama embedding provider for semantic memory");
+                    Some(Arc::new(forge_llm::embed_ollama::OllamaEmbeddingProvider::new(
+                        base.clone(), model.clone(), *dim,
+                    )))
+                }
+            };
+
         let exec_deps = ExecutionDeps {
             missions:  missions_repo.clone(),
             goals:     goals_repo.clone(),
@@ -567,6 +653,7 @@ impl Runtime {
             episodic_recall,
             queue:      if config.workers > 0 { Some(queue_repo.clone()) } else { None },
             org_memory: if config.org_memory_enabled { Some(org_memory_repo.clone()) } else { None },
+            embedding_provider: embedder.clone(),
         };
 
         tracing::info!("forge runtime booted");
@@ -819,9 +906,100 @@ fn is_mutating_tool(name: &str) -> bool {
 }
 
 /// Convenience: install a JSON tracing subscriber if the caller hasn't yet.
+///
+/// When `FORGE_OTLP_ENDPOINT` is set (e.g. `http://localhost:4318` for the
+/// Collector's HTTP receiver), also attach a `tracing-opentelemetry` layer
+/// that exports spans over OTLP/HTTP-protobuf. When unset, this is
+/// identical to the pre-Phase-6 behaviour: a plain fmt subscriber and
+/// nothing else.
+///
+/// Service name defaults to `forge-runtime`, overridable via
+/// `FORGE_OTEL_SERVICE_NAME`.
 pub fn install_tracing_default() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("forge_=info,warn")))
-        .try_init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("forge_=info,warn"));
+
+    // Fast path: no OTLP configured → keep the pre-Phase-6 fmt-only setup.
+    let otlp_endpoint = std::env::var("FORGE_OTLP_ENDPOINT").ok()
+        .filter(|s| !s.is_empty());
+    if otlp_endpoint.is_none() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+        return;
+    }
+
+    // OTLP path — layered subscriber with fmt + otel.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let endpoint = otlp_endpoint.unwrap();
+    let service_name = std::env::var("FORGE_OTEL_SERVICE_NAME")
+        .unwrap_or_else(|_| "forge-runtime".to_string());
+
+    match build_otel_layer(&endpoint, &service_name) {
+        Ok(otel_layer) => {
+            // NOTE: `OpenTelemetryLayer<Registry, Tracer>` only implements
+            // `Layer<Registry>`, so it MUST be the innermost layer applied to
+            // the Registry. Placing it above other layers gives a type error.
+            let _ = tracing_subscriber::registry()
+                .with(otel_layer)
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer())
+                .try_init();
+            tracing::info!(%endpoint, %service_name, "OpenTelemetry OTLP exporter installed");
+        }
+        Err(e) => {
+            // Never fail boot because tracing setup broke — fall back to fmt.
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .try_init();
+            tracing::warn!(err = %e, %endpoint, "failed to install OTLP exporter; using fmt only");
+        }
+    }
+}
+
+/// Build the `tracing-opentelemetry` layer wired to the configured OTLP endpoint.
+///
+/// Uses the HTTP-protobuf transport (path `/v1/traces`) because it's the most
+/// widely-supported Collector receiver and requires no extra plumbing.
+fn build_otel_layer(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<
+    tracing_opentelemetry::OpenTelemetryLayer<
+        tracing_subscriber::Registry,
+        opentelemetry_sdk::trace::Tracer,
+    >,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    use opentelemetry::KeyValue;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::{Protocol, WithExportConfig};
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::Config as SdkTraceConfig;
+
+    let traces_endpoint = if endpoint.ends_with("/v1/traces") {
+        endpoint.to_string()
+    } else {
+        format!("{}/v1/traces", endpoint.trim_end_matches('/'))
+    };
+
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", service_name.to_string()),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
+    ]);
+
+    let provider = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .http()
+                .with_endpoint(traces_endpoint)
+                .with_protocol(Protocol::HttpBinary),
+        )
+        .with_trace_config(SdkTraceConfig::default().with_resource(resource))
+        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+
+    let tracer = provider.tracer("forge");
+    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
 }

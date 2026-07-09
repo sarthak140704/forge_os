@@ -6,9 +6,15 @@
 
 pub mod openrouter;
 pub mod openai;
+pub mod anthropic;
+pub mod gemini;
 pub mod ollama;
 pub mod groq;
 pub mod mock;
+
+// Phase 6a — semantic memory: embedding providers.
+pub mod embed_openai;
+pub mod embed_ollama;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -30,6 +36,29 @@ pub enum LlmError {
     InvalidResponse(String),
     #[error("provider error: {0}")]
     Provider(String),
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 6a — embedding provider trait.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A provider that turns arbitrary text into a fixed-dimension vector.
+/// Used for semantic recall over `org_memory` in Phase 6a.
+///
+/// Providers are expected to be cheap to construct + `Clone`; the runtime
+/// wraps them in an `Arc<dyn EmbeddingProvider>` and hands that to the
+/// mission service.
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    /// Human-readable name (e.g. `"openai:text-embedding-3-small"`).
+    fn name(&self) -> &str;
+    /// The dimension of the vectors this provider returns. Used to skip
+    /// rows in `org_memory` embedded by a different provider.
+    fn dim(&self) -> usize;
+    /// Embed a single string. Long inputs may be truncated by the
+    /// provider; callers should keep individual embeddings under a few
+    /// thousand tokens.
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

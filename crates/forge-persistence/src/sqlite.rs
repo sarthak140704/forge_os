@@ -48,6 +48,19 @@ pub async fn connect(url: &str) -> Result<SqlitePool, PersistenceError> {
         if s.is_empty() { continue; }
         sqlx::query(s).execute(&pool).await?;
     }
+    // Phase 6a: semantic-memory embedding columns. `ALTER TABLE ADD COLUMN`
+    // isn't idempotent in SQLite, so we tolerate "duplicate column name"
+    // errors (i.e. the migration already ran on a previous boot).
+    for stmt in migrations::V005_SEMANTIC_MEMORY.split(';') {
+        let s = stmt.trim();
+        if s.is_empty() { continue; }
+        if let Err(e) = sqlx::query(s).execute(&pool).await {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+    }
     Ok(pool)
 }
 
@@ -864,6 +877,8 @@ impl SqliteOrgMemoryRepository {
 fn parse_memory_row(r: sqlx::sqlite::SqliteRow) -> crate::OrgMemoryRow {
     let tags_json: String = r.try_get::<String, _>("tags").unwrap_or_else(|_| "[]".into());
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let embedding_bytes: Option<Vec<u8>> = r.try_get::<Option<Vec<u8>>, _>("embedding").unwrap_or(None);
+    let embedding = embedding_bytes.and_then(bytes_to_vec_f32);
     crate::OrgMemoryRow {
         id:                r.try_get::<i64, _>("id").unwrap_or_default(),
         key:               r.try_get::<String, _>("key").unwrap_or_default(),
@@ -872,7 +887,45 @@ fn parse_memory_row(r: sqlx::sqlite::SqliteRow) -> crate::OrgMemoryRow {
         source_mission_id: r.try_get::<Option<String>, _>("source_mission_id").unwrap_or(None),
         created_at:        r.try_get::<String, _>("created_at").unwrap_or_default(),
         retired_at:        r.try_get::<Option<String>, _>("retired_at").unwrap_or(None),
+        embedding,
     }
+}
+
+/// Phase 6a — encode a Vec<f32> as raw little-endian bytes for BLOB storage.
+fn vec_f32_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+/// Phase 6a — inverse of `vec_f32_to_bytes`. Returns None on a truncated
+/// blob (length not divisible by 4) so callers can silently skip corrupt
+/// rows instead of aborting the search.
+fn bytes_to_vec_f32(b: Vec<u8>) -> Option<Vec<f32>> {
+    if b.len() % 4 != 0 { return None; }
+    let mut out = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Some(out)
+}
+
+/// Phase 6a — cosine similarity, `1.0` = identical direction, `0.0` =
+/// orthogonal. Returns 0.0 if either vector is zero-length.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    let mut dot = 0.0f32;
+    let mut na  = 0.0f32;
+    let mut nb  = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na  += a[i] * a[i];
+        nb  += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 { return 0.0; }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 #[async_trait]
@@ -881,14 +934,21 @@ impl crate::OrgMemoryRepository for SqliteOrgMemoryRepository {
         let tags_json = serde_json::to_string(&m.tags)?;
         let now = ts_to_str(OffsetDateTime::now_utc());
         let src = m.source_mission_id.map(|id| id.to_string());
+        let (emb_blob, emb_dim): (Option<Vec<u8>>, Option<i64>) = match m.embedding.as_ref() {
+            Some(v) if !v.is_empty() => (Some(vec_f32_to_bytes(v)), Some(v.len() as i64)),
+            _ => (None, None),
+        };
         let res = sqlx::query(
-            "INSERT INTO org_memory (key, value, tags, source_mission_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO org_memory (key, value, tags, source_mission_id, created_at, embedding, embedding_dim) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(&m.key)
         .bind(&m.value)
         .bind(tags_json)
         .bind(src)
         .bind(now)
+        .bind(emb_blob)
+        .bind(emb_dim)
         .execute(&self.pool)
         .await?;
         Ok(res.last_insert_rowid())
@@ -908,7 +968,7 @@ impl crate::OrgMemoryRepository for SqliteOrgMemoryRepository {
 
     async fn list_active(&self, limit: usize) -> Result<Vec<crate::OrgMemoryRow>, PersistenceError> {
         let rows = sqlx::query(
-            "SELECT id, key, value, tags, source_mission_id, created_at, retired_at \
+            "SELECT id, key, value, tags, source_mission_id, created_at, retired_at, embedding \
              FROM org_memory WHERE retired_at IS NULL ORDER BY id DESC LIMIT ?1",
         )
         .bind(limit as i64)
@@ -935,7 +995,7 @@ impl crate::OrgMemoryRepository for SqliteOrgMemoryRepository {
             binds.push(pat);
         }
         let sql = format!(
-            "SELECT id, key, value, tags, source_mission_id, created_at, retired_at \
+            "SELECT id, key, value, tags, source_mission_id, created_at, retired_at, embedding \
              FROM org_memory WHERE retired_at IS NULL AND ({}) ORDER BY id DESC LIMIT ?",
             where_clauses.join(" OR "),
         );
@@ -952,6 +1012,52 @@ impl crate::OrgMemoryRepository for SqliteOrgMemoryRepository {
         }).collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
         Ok(scored.into_iter().map(|(_, r)| r).collect())
+    }
+
+    async fn semantic_search(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(f32, crate::OrgMemoryRow)>, PersistenceError> {
+        if query.is_empty() || limit == 0 {
+            return Ok(vec![]);
+        }
+        // We only care about rows whose embedding dimension matches the
+        // query — mixing providers with different dims would produce
+        // meaningless cosine values. SQLite can filter this cheaply.
+        let rows = sqlx::query(
+            "SELECT id, key, value, tags, source_mission_id, created_at, retired_at, embedding \
+             FROM org_memory \
+             WHERE retired_at IS NULL AND embedding IS NOT NULL AND embedding_dim = ?1",
+        )
+        .bind(query.len() as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut scored: Vec<(f32, crate::OrgMemoryRow)> = rows.into_iter().filter_map(|r| {
+            let row = parse_memory_row(r);
+            let emb = row.embedding.as_ref()?;
+            Some((cosine(query, emb), row))
+        }).collect();
+        // Descending by score; NaN pushed to the bottom.
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    async fn set_embedding(&self, id: i64, embedding: &[f32]) -> Result<bool, PersistenceError> {
+        if embedding.is_empty() {
+            return Ok(false);
+        }
+        let blob = vec_f32_to_bytes(embedding);
+        let res = sqlx::query(
+            "UPDATE org_memory SET embedding=?1, embedding_dim=?2 WHERE id=?3",
+        )
+        .bind(blob)
+        .bind(embedding.len() as i64)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 }
 
@@ -1024,12 +1130,14 @@ mod queue_and_memory_tests {
             value:             "This repo uses pytest -q via a venv at .venv/".into(),
             tags:              vec!["python".into(), "testing".into()],
             source_mission_id: None,
+            embedding:         None,
         }).await.unwrap();
         let _ = repo.insert(&NewOrgMemory {
             key:               "unrelated".into(),
             value:             "totally different subject matter".into(),
             tags:              vec!["misc".into()],
             source_mission_id: None,
+            embedding:         None,
         }).await.unwrap();
         let hits = repo.search(&["python".into()], 10).await.unwrap();
         assert_eq!(hits.len(), 1);
@@ -1041,5 +1149,87 @@ mod queue_and_memory_tests {
         let active = repo.list_active(10).await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].key, "unrelated");
+    }
+
+    // ── Phase 6a — semantic memory ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_semantic_search_ranks_by_cosine() {
+        let pool = fresh_pool().await;
+        let repo = SqliteOrgMemoryRepository::new(pool);
+
+        // Insert three rows with hand-picked orthogonal-ish 4-dim vectors
+        // so we can predict cosine scores precisely.
+        let mostly_x = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let some_x   = vec![0.6_f32, 0.4, 0.4, 0.4];
+        let mostly_y = vec![0.0_f32, 1.0, 0.0, 0.0];
+
+        let id_x = repo.insert(&NewOrgMemory {
+            key: "x".into(), value: "along x axis".into(),
+            tags: vec![], source_mission_id: None,
+            embedding: Some(mostly_x.clone()),
+        }).await.unwrap();
+        let id_mid = repo.insert(&NewOrgMemory {
+            key: "mid".into(), value: "biased toward x with some y/z".into(),
+            tags: vec![], source_mission_id: None,
+            embedding: Some(some_x.clone()),
+        }).await.unwrap();
+        let _id_y = repo.insert(&NewOrgMemory {
+            key: "y".into(), value: "along y axis".into(),
+            tags: vec![], source_mission_id: None,
+            embedding: Some(mostly_y.clone()),
+        }).await.unwrap();
+
+        // Query along x — the pure-x row should rank first, mid second.
+        let hits = repo.semantic_search(&mostly_x, 3).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].1.id, id_x);
+        assert_eq!(hits[1].1.id, id_mid);
+        // cosine of x with y is 0, so worst hit should be near 0.
+        assert!(hits[2].0.abs() < 0.001);
+        // Best hit's cosine is 1.
+        assert!((hits[0].0 - 1.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn memory_semantic_search_ignores_mismatched_dims() {
+        let pool = fresh_pool().await;
+        let repo = SqliteOrgMemoryRepository::new(pool);
+        // A dim-4 row and a dim-8 row; a dim-4 query should only see the dim-4 row.
+        let _id_a = repo.insert(&NewOrgMemory {
+            key: "a".into(), value: "".into(), tags: vec![],
+            source_mission_id: None,
+            embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+        }).await.unwrap();
+        let _id_b = repo.insert(&NewOrgMemory {
+            key: "b".into(), value: "".into(), tags: vec![],
+            source_mission_id: None,
+            embedding: Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        }).await.unwrap();
+        let hits = repo.semantic_search(&[1.0_f32, 0.0, 0.0, 0.0], 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.key, "a");
+    }
+
+    #[tokio::test]
+    async fn memory_set_embedding_backfills_existing_row() {
+        let pool = fresh_pool().await;
+        let repo = SqliteOrgMemoryRepository::new(pool);
+        let id = repo.insert(&NewOrgMemory {
+            key: "k".into(), value: "v".into(), tags: vec![],
+            source_mission_id: None, embedding: None,
+        }).await.unwrap();
+        // Before backfill: semantic search returns nothing.
+        let before = repo.semantic_search(&[1.0_f32, 0.0], 5).await.unwrap();
+        assert!(before.is_empty());
+        // Backfill and re-query.
+        assert!(repo.set_embedding(id, &[1.0_f32, 0.0]).await.unwrap());
+        let after = repo.semantic_search(&[1.0_f32, 0.0], 5).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].1.id, id);
+        // Retired rows are excluded from semantic search too.
+        assert!(repo.retire(id).await.unwrap());
+        let post_retire = repo.semantic_search(&[1.0_f32, 0.0], 5).await.unwrap();
+        assert!(post_retire.is_empty());
     }
 }

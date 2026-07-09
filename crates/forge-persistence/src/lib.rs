@@ -272,6 +272,11 @@ pub trait MissionQueueRepository: Send + Sync {
 /// keyword-based recall in the planner prompt (LIKE-search on the JSON
 /// array of lowercased strings). `retired_at` is set by the UI to hide a
 /// memory without deleting it.
+///
+/// Phase 6a: `embedding` is the raw little-endian f32 bytes of a fixed-size
+/// vector produced by whichever embedding provider is wired at boot; `None`
+/// means the row was written before Phase 6a or with no provider configured,
+/// in which case only the keyword search sees it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OrgMemoryRow {
     pub id:                i64,
@@ -281,6 +286,8 @@ pub struct OrgMemoryRow {
     pub source_mission_id: Option<String>,
     pub created_at:        String,
     pub retired_at:        Option<String>,
+    #[serde(skip)]
+    pub embedding:         Option<Vec<f32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +296,11 @@ pub struct NewOrgMemory {
     pub value:             String,
     pub tags:              Vec<String>,
     pub source_mission_id: Option<MissionId>,
+    /// Phase 6a: if the runtime has an embedding provider wired, planners
+    /// should embed the (key, value) tuple and pass the vector here so
+    /// semantic recall can find it. `None` still works — the row just
+    /// won't be reachable via semantic search until backfilled.
+    pub embedding:         Option<Vec<f32>>,
 }
 
 #[async_trait]
@@ -306,6 +318,26 @@ pub trait OrgMemoryRepository: Send + Sync {
     /// ANY of the given keywords (case-insensitive), scored by match
     /// count. Empty keyword list returns an empty vec.
     async fn search(&self, keywords: &[String], limit: usize) -> Result<Vec<OrgMemoryRow>, PersistenceError>;
+
+    /// Phase 6a — semantic search.
+    ///
+    /// Fetches every non-retired row that has a stored embedding of the
+    /// same dimension as `query`, then computes cosine similarity in
+    /// Rust and returns the top `limit` (score, row) pairs, best first.
+    ///
+    /// Falls back to an empty vec if no embedded rows match the query's
+    /// dimension. Callers are expected to fall back to keyword `search`
+    /// in that case so the personal-project MVP still recalls something.
+    async fn semantic_search(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(f32, OrgMemoryRow)>, PersistenceError>;
+
+    /// Phase 6a — backfill embedding on an existing row. Used by the
+    /// UI's "re-embed" action and by lazy backfill in the mission
+    /// service. No-op returning `false` if the row is missing.
+    async fn set_embedding(&self, id: i64, embedding: &[f32]) -> Result<bool, PersistenceError>;
 }
 
 pub use sqlite::{

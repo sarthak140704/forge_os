@@ -4,7 +4,7 @@
 use forge_domain::{ForgeEvent, Goal, GoalId, GoalStatus, Mission, MissionId, MissionStatus, MissionSummary, Task, TaskId, TaskStatus};
 use forge_events::EventBus;
 use forge_execution::ExecutionEngine;
-use forge_llm::LlmRouter;
+use forge_llm::{EmbeddingProvider, LlmRouter};
 use forge_persistence::{
     GoalRepository, MissionQueueRepository, MissionRepository, NewOrgMemory,
     OrgMemoryRepository, ReflectionRepository, TaskRepository,
@@ -83,6 +83,15 @@ pub struct MissionService {
     /// keywords, and future missions' planners recall matching rows.
     #[allow(clippy::type_complexity)]
     pub org_memory: Option<Arc<dyn OrgMemoryRepository>>,
+
+    /// Phase 6a — embedding provider for semantic recall over org_memory.
+    /// When set, `fetch_org_memory_block` uses it to rank rows by
+    /// cosine similarity instead of (well: in addition to) keyword LIKE
+    /// search, and freshly-written memories get their embedding
+    /// backfilled in a spawned task so recall degrades gracefully.
+    /// `None` keeps the old keyword-only behaviour.
+    #[allow(clippy::type_complexity)]
+    pub embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 /// Recall provider — the runtime binds this to a keyword search over prior
@@ -267,23 +276,59 @@ impl MissionService {
         }
     }
 
-    /// Phase 4f — pull top-K matching memory rows for this mission's
-    /// title + description keywords and format them as a planner block.
-    /// Returns None when memory isn't wired or there are no matches.
+    /// Phase 4f + 6a — pull top-K matching memory rows for this mission's
+    /// title + description as a planner block. Prefers semantic recall
+    /// (cosine over embeddings) when an embedding provider is wired;
+    /// falls back to keyword LIKE search when embeddings are unavailable
+    /// or return no matches. Returns None when nothing at all was found.
     async fn fetch_org_memory_block(&self, mission: &Mission) -> Option<String> {
         let repo = self.org_memory.as_ref()?;
         let text = format!("{} {}", mission.title, mission.description);
-        let keywords = keyword_extract(&text, 8);
-        if keywords.is_empty() {
-            return None;
+
+        // ── 6a: try semantic first ──────────────────────────────────────
+        let mut rows: Vec<(f32, forge_persistence::OrgMemoryRow)> = Vec::new();
+        let mut used_semantic = false;
+        if let Some(embedder) = self.embedding_provider.as_ref() {
+            match embedder.embed(&text).await {
+                Ok(qvec) => {
+                    used_semantic = true;
+                    match repo.semantic_search(&qvec, 5).await {
+                        Ok(hits) => rows = hits.into_iter()
+                            // Skip cosine below 0.20 — very likely noise.
+                            .filter(|(s, _)| *s >= 0.20)
+                            .collect(),
+                        Err(e) => tracing::warn!(err = %e, "semantic_search failed; falling back"),
+                    }
+                }
+                Err(e) => tracing::warn!(err = %e, "embedding for recall failed; falling back to keyword"),
+            }
         }
-        let rows = repo.search(&keywords, 5).await.ok()?;
+
+        // ── 4f: keyword fallback (also runs when semantic yielded nothing) ─
         if rows.is_empty() {
-            return None;
+            let keywords = keyword_extract(&text, 8);
+            if keywords.is_empty() { return None; }
+            match repo.search(&keywords, 5).await.ok() {
+                Some(kw_rows) if !kw_rows.is_empty() => {
+                    rows = kw_rows.into_iter().map(|r| (0.0_f32, r)).collect();
+                }
+                _ => return None,
+            }
         }
-        let mut out = String::from("## Prior learnings\n");
-        for r in &rows {
-            out.push_str(&format!("- **{}** — {}\n", r.key, truncate(&r.value, 200)));
+        if rows.is_empty() { return None; }
+
+        let header = if used_semantic {
+            "## Prior learnings (semantic recall)\n"
+        } else {
+            "## Prior learnings\n"
+        };
+        let mut out = String::from(header);
+        for (score, r) in &rows {
+            if used_semantic {
+                out.push_str(&format!("- **{}** _(sim {:.2})_ — {}\n", r.key, score, truncate(&r.value, 200)));
+            } else {
+                out.push_str(&format!("- **{}** — {}\n", r.key, truncate(&r.value, 200)));
+            }
         }
         Some(out)
     }
@@ -464,10 +509,30 @@ impl MissionService {
                     value:             truncate(trimmed, 500).to_string(),
                     tags:              tags.clone(),
                     source_mission_id: Some(id),
+                    embedding:         None, // Phase 6a: filled lazily by embedder task
                 };
                 match mem.insert(&new).await {
                     Ok(row_id) => {
                         memory_written += 1;
+                        // Phase 6a — best-effort backfill: embed the
+                        // memory value in a spawned task so future
+                        // missions can recall it semantically. Failures
+                        // are logged, never fatal; the row still exists
+                        // and is reachable via keyword search.
+                        if let Some(embedder) = self.embedding_provider.clone() {
+                            let repo = mem.clone();
+                            let val = new.value.clone();
+                            tokio::spawn(async move {
+                                match embedder.embed(&val).await {
+                                    Ok(vec) => {
+                                        if let Err(e) = repo.set_embedding(row_id, &vec).await {
+                                            tracing::warn!(row_id, err = %e, "set_embedding failed");
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(row_id, err = %e, "embed for memory row failed"),
+                                }
+                            });
+                        }
                         let _ = self.events.publish(ForgeEvent::OrgMemoryLearned {
                             mission_id: id, memory_id: row_id, key: key.clone(),
                         }).await;

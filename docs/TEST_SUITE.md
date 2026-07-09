@@ -1443,3 +1443,84 @@ Automated equivalent: `cargo test -p forge-cli --test end_to_end cli_plugin_bund
 - Behaviour of the planner is probabilistic — accept minor phrasing differences in task descriptions; the backend-proof steps are deterministic.
 - TC-P3-01 (feature flags) and TC-P4B-04 (autopromoter interval) require a restart; skip in fast smoke runs.
 - Your live DB currently has 23 missions, 61 goals, 67 tasks, 868 events, 18 reflections, 5 active skills — the inspector confirms it's already accumulating real state.
+
+
+---
+
+# Phase 6 tests (added this session)
+
+## TC-P6C-01 — Anthropic + Gemini response parsing (unit)
+**What:** Both adapters round-trip typical + error payloads without panicking; Anthropic hoists `role: system` into the top-level `system` field.
+**Run:** `cargo test -p forge-llm`
+**Expect:** 7 passed (2 embed, 3 anthropic, 2 gemini).
+
+## TC-P6C-02 — Anthropic via failover chain (manual, needs `ANTHROPIC_API_KEY`)
+**What:** With no other keys set, mission planning uses Claude and produces a valid plan.
+**Prep:** `[System.Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY','sk-ant-...','User')` — restart Tauri.
+**Run:** Create a mission "Summarise the file `docs/ARCHITECTURE.md` in three bullets."
+**Expect:** Plan appears, `LlmResponded` event mentions `claude-3-5-haiku-latest`, mission completes.
+
+## TC-P6C-03 — Gemini via failover chain (manual, needs `GEMINI_API_KEY`)
+**What:** Same as -02 but Gemini.
+**Prep:** Set `GEMINI_API_KEY`; unset all higher-priority keys.
+**Run:** Same mission.
+**Expect:** `LlmResponded` mentions `gemini-1.5-flash`.
+
+## TC-P6B-01 — OTLP export smoke (manual, needs a local collector)
+**What:** With `FORGE_OTLP_ENDPOINT=http://localhost:4318` set, boot the runtime and confirm the collector logs incoming spans.
+**Prep:** `docker run --rm -p 4318:4318 otel/opentelemetry-collector:latest --config=/etc/otel-collector-config.yaml` (or your existing collector).
+**Run:** `[System.Environment]::SetEnvironmentVariable('FORGE_OTLP_ENDPOINT','http://localhost:4318','User')`, launch Tauri, kick off any mission.
+**Expect:** Collector logs show `service.name=forge-runtime` spans (mission, planner, LLM, task).
+
+## TC-P6B-02 — OTLP is opt-in (unit)
+**What:** With no `FORGE_OTLP_ENDPOINT`, the runtime boots the fmt-only subscriber and no OTLP calls happen.
+**Run:** `cargo test -p forge-runtime`.
+**Expect:** existing tests unchanged (they never set the env var).
+
+## TC-P6E-01 — Discord signature verification (unit)
+**What:** ed25519 over `timestamp || body` accepts correct sigs, rejects tampered bodies.
+**Run:** `cargo test -p forge-gateway discord_signature`
+**Expect:** `discord_signature_verifies_when_correct` and `discord_signature_rejects_tampered_body` pass.
+
+## TC-P6E-02 — Discord command text extraction (unit)
+**What:** First STRING option (type=3) wins; falls back to command name when absent.
+**Run:** `cargo test -p forge-gateway discord_extracts`
+**Expect:** both `discord_extracts_string_option` and `discord_falls_back_to_command_name` pass.
+
+## TC-P6E-03 — Discord live PING (manual, needs a real bot)
+**What:** Register the endpoint URL in Discord Developer Portal → app → Interactions Endpoint URL. Discord issues a PING; the endpoint responds with PONG or the URL is rejected.
+**Prep:** Set `DISCORD_APPLICATION_PUBLIC_KEY` on the running gateway. Deploy the gateway behind a public HTTPS URL (ngrok fine).
+**Expect:** Discord accepts the URL. Save-time PING appears in gateway logs.
+
+## TC-P6E-04 — Telegram webhook echo (manual, needs a real bot token)
+**What:** Bot receives a message and calls the gateway; gateway forwards to Forge; reply is `sendMessage`d back to the chat.
+**Prep:** `TELEGRAM_BOT_TOKEN=...`, optional `TELEGRAM_SECRET_TOKEN=...`. Set webhook: `curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<PUBLIC_URL>/telegram/webhook&secret_token=<SECRET>"`.
+**Run:** DM the bot "list files in the workspace".
+**Expect:** Bot replies with the Forge mission output.
+
+## TC-P6A-01 — Semantic memory ranks by cosine (unit)
+**What:** Three memory rows with hand-picked 4-dim vectors; a query along x correctly ranks the pure-x row first.
+**Run:** `cargo test -p forge-persistence memory_semantic_search_ranks_by_cosine`
+**Expect:** pass.
+
+## TC-P6A-02 — Semantic search skips mismatched dims (unit)
+**What:** A dim-4 row and a dim-8 row live in the same table; a dim-4 query only sees the dim-4 row.
+**Run:** `cargo test -p forge-persistence memory_semantic_search_ignores_mismatched_dims`
+**Expect:** pass.
+
+## TC-P6A-03 — Lazy backfill via `set_embedding` (unit)
+**What:** Insert an embedding-less row, backfill via `set_embedding`, semantic search now finds it; retiring the row hides it from semantic search.
+**Run:** `cargo test -p forge-persistence memory_set_embedding_backfills_existing_row`
+**Expect:** pass.
+
+## TC-P6A-04 — Semantic recall beats keyword on nuance (manual, needs `OPENAI_API_KEY` or a local ollama with `nomic-embed-text`)
+**What:** Prove semantic recall surfaces a memory the keyword recall would miss.
+**Prep:** Add to `forge.toml`:
+```toml
+[embedding_provider]
+kind = "openai"      # or "ollama"
+api_key_env = "OPENAI_API_KEY"
+```
+Then, with the desktop app, run mission A: "This project uses pytest." — wait for reflection to persist an org-memory row and let the spawned embedder task backfill it.
+**Run:** Create mission B: "How should I check that a Python function raises the right exception?"
+**Expect:** Planner prompt includes the "pytest" org-memory row under `## Prior learnings (semantic recall)` even though "pytest" and "raises" don't share keywords. Without an embedding provider the keyword search would silently miss it.

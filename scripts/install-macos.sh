@@ -168,6 +168,7 @@ Next steps:
   1. Open a NEW shell so PATH updates apply.
   2. Set an LLM key, e.g.:
        export GROQ_API_KEY='<your-key>'
+     Phase 6c: ANTHROPIC_API_KEY / GEMINI_API_KEY are also picked up automatically.
   3. Boot the desktop app:
        cd apps/forge-desktop
        node ./frontend/node_modules/@tauri-apps/cli/tauri.js dev \\
@@ -177,8 +178,14 @@ Next steps:
        forge --help
   5. Optional — VS Code extension:
        cd apps/forge-vscode && npm install && npm run compile   # then press F5 in VS Code
-  6. Optional — build the messaging gateway (Slack + generic webhook):
+  6. Optional — build the messaging gateway (Slack + generic + Discord + Telegram):
        cargo install --path apps/forge-gateway
-       FORGE_TOKEN='<same as FORGE_API_TOKEN>' forge-gateway
+       FORGE_TOKEN='<same as FORGE_API_TOKEN>' \\
+       DISCORD_APPLICATION_PUBLIC_KEY='<hex>' \\      # Phase 6e — Discord opt-in
+       TELEGRAM_BOT_TOKEN='<bot-token>' \\            # Phase 6e — Telegram opt-in
+       forge-gateway
+  7. Optional — OpenTelemetry (Phase 6b):
+       export FORGE_OTLP_ENDPOINT='http://localhost:4318'   # OTLP HTTP-protobuf
+       export FORGE_OTEL_SERVICE_NAME='my-forge'            # optional override
        # then POST http://127.0.0.1:7824/webhook with Bearer GATEWAY_SHARED_SECRET
 EOM

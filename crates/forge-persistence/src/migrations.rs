@@ -127,3 +127,13 @@ CREATE INDEX IF NOT EXISTS idx_org_memory_key      ON org_memory(key);
 CREATE INDEX IF NOT EXISTS idx_org_memory_active   ON org_memory(retired_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_org_memory_source   ON org_memory(source_mission_id);
 "#;
+
+/// Phase 6a — semantic memory. `embedding` stores a Vec<f32> as raw
+/// little-endian f32 bytes; `embedding_dim` is redundant but useful for
+/// validation before cosine ranking. Both are NULLable — pre-6a rows and
+/// rows written when no embedding provider is configured stay usable
+/// (they fall back to the keyword search).
+pub const V005_SEMANTIC_MEMORY: &str = r#"
+ALTER TABLE org_memory ADD COLUMN embedding BLOB;
+ALTER TABLE org_memory ADD COLUMN embedding_dim INTEGER;
+"#;

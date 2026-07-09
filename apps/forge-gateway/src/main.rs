@@ -1,21 +1,29 @@
 //! # forge-gateway — webhook bridge for messaging platforms
 //!
 //! A tiny axum server that:
-//!   * Receives inbound webhooks from Slack (and a generic `POST /webhook`
-//!     endpoint that any tool can use).
+//!   * Receives inbound webhooks from Slack, Discord, Telegram, and a
+//!     generic `POST /webhook` endpoint that any tool can use.
 //!   * Forwards the extracted user text to a running Forge OS API server's
 //!     OpenAI-compat shim (`POST /v1/chat/completions`).
 //!   * Replies to the caller with the assistant text (generic path) or
-//!     posts to the caller's `response_url` (Slack path).
+//!     posts to the caller's `response_url` (Slack path), or edits the
+//!     deferred interaction (Discord), or calls sendMessage (Telegram).
 //!
 //! ## Env
 //!
-//!   FORGE_URL             — Forge API base URL (default http://127.0.0.1:7823)
-//!   FORGE_TOKEN           — Forge bearer token
-//!   GATEWAY_BIND          — where to listen (default 127.0.0.1:7824)
-//!   GATEWAY_SHARED_SECRET — bearer expected on POST /webhook (empty = open)
-//!   SLACK_SIGNING_SECRET  — Slack's signing secret. Empty = skip verify.
-//!                          Real deployments MUST set this.
+//!   FORGE_URL                        — Forge API base URL (default http://127.0.0.1:7823)
+//!   FORGE_TOKEN                      — Forge bearer token
+//!   GATEWAY_BIND                     — where to listen (default 127.0.0.1:7824)
+//!   GATEWAY_SHARED_SECRET            — bearer expected on POST /webhook (empty = open)
+//!   SLACK_SIGNING_SECRET             — Slack's signing secret. Empty = skip verify.
+//!                                       Real deployments MUST set this.
+//!   DISCORD_APPLICATION_PUBLIC_KEY   — Discord app's public key (hex, 64 chars).
+//!                                       Empty disables /discord/interactions.
+//!   TELEGRAM_BOT_TOKEN               — Telegram bot token (`123:ABC...`).
+//!                                       Empty disables /telegram/webhook.
+//!   TELEGRAM_SECRET_TOKEN            — Optional. When set, incoming Telegram
+//!                                       requests MUST carry a matching
+//!                                       `X-Telegram-Bot-Api-Secret-Token` header.
 //!
 //! ## Endpoints
 //!
@@ -40,6 +48,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -75,6 +84,19 @@ struct Cli {
     #[arg(long, env = "SLACK_SIGNING_SECRET", default_value = "")]
     slack_signing_secret: String,
 
+    /// Discord application public key (hex, 64 chars). Empty disables /discord/interactions.
+    #[arg(long, env = "DISCORD_APPLICATION_PUBLIC_KEY", default_value = "")]
+    discord_public_key: String,
+
+    /// Telegram bot token. Empty disables /telegram/webhook.
+    #[arg(long, env = "TELEGRAM_BOT_TOKEN", default_value = "")]
+    telegram_bot_token: String,
+
+    /// Optional Telegram secret token — when set, the incoming request must carry
+    /// a matching X-Telegram-Bot-Api-Secret-Token header.
+    #[arg(long, env = "TELEGRAM_SECRET_TOKEN", default_value = "")]
+    telegram_secret_token: String,
+
     /// Request timeout in seconds for the Forge upstream.
     #[arg(long, default_value_t = 300)]
     upstream_timeout: u64,
@@ -87,6 +109,9 @@ pub struct AppState {
     forge_token: Arc<String>,
     shared_secret: Arc<String>,
     slack_signing_secret: Arc<String>,
+    discord_public_key: Arc<String>,
+    telegram_bot_token: Arc<String>,
+    telegram_secret_token: Arc<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +138,16 @@ async fn main() -> Result<()> {
         forge_token: Arc::new(cli.forge_token),
         shared_secret: Arc::new(cli.shared_secret),
         slack_signing_secret: Arc::new(cli.slack_signing_secret),
+        discord_public_key: Arc::new(cli.discord_public_key),
+        telegram_bot_token: Arc::new(cli.telegram_bot_token),
+        telegram_secret_token: Arc::new(cli.telegram_secret_token),
     };
+    if state.discord_public_key.is_empty() {
+        tracing::warn!("DISCORD_APPLICATION_PUBLIC_KEY empty — /discord/interactions is DISABLED");
+    }
+    if state.telegram_bot_token.is_empty() {
+        tracing::warn!("TELEGRAM_BOT_TOKEN empty — /telegram/webhook is DISABLED");
+    }
 
     if state.forge_token.is_empty() {
         tracing::warn!("FORGE_TOKEN is empty — Forge upstream must have auth disabled");
@@ -135,9 +169,11 @@ async fn main() -> Result<()> {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/health",         get(health))
-        .route("/webhook",        post(generic_webhook))
-        .route("/slack/commands", post(slack_slash))
+        .route("/health",               get(health))
+        .route("/webhook",              post(generic_webhook))
+        .route("/slack/commands",       post(slack_slash))
+        .route("/discord/interactions", post(discord_interactions))
+        .route("/telegram/webhook",     post(telegram_webhook))
         .with_state(state)
 }
 
@@ -311,6 +347,191 @@ fn verify_slack_signature(secret: &str, headers: &HeaderMap, body: &str) -> Resu
 }
 
 // ---------------------------------------------------------------------------
+// /discord/interactions
+// ---------------------------------------------------------------------------
+//
+// Discord sends every interaction (button clicks, slash commands, ping)
+// signed with an ed25519 signature keyed to the application's public key.
+// We verify the signature over `timestamp || body`.
+//
+// type=1 (PING) — respond with type=1 (PONG). Discord uses this to verify
+//                  our endpoint at setup time.
+// type=2 (APPLICATION_COMMAND) — respond with type=5 (deferred), then edit
+//                                 the response via PATCH /webhooks/{app_id}/
+//                                 {interaction_token}/messages/@original.
+
+const DISCORD_TYPE_PING:                 u64 = 1;
+const DISCORD_TYPE_APPLICATION_COMMAND:  u64 = 2;
+const DISCORD_RESPONSE_PONG:             u64 = 1;
+const DISCORD_RESPONSE_DEFERRED_MESSAGE: u64 = 5;
+
+async fn discord_interactions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    if state.discord_public_key.is_empty() {
+        return (StatusCode::NOT_FOUND, "discord adapter disabled").into_response();
+    }
+    if let Err(e) = verify_discord_signature(&state.discord_public_key, &headers, &body) {
+        tracing::warn!(err = %e, "discord signature verification failed");
+        return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(err = %e, "discord payload parse failed");
+            return (StatusCode::BAD_REQUEST, "invalid json").into_response();
+        }
+    };
+    let itype = payload.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
+    if itype == DISCORD_TYPE_PING {
+        return Json(serde_json::json!({"type": DISCORD_RESPONSE_PONG})).into_response();
+    }
+    if itype != DISCORD_TYPE_APPLICATION_COMMAND {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "type": DISCORD_RESPONSE_DEFERRED_MESSAGE,
+        }))).into_response();
+    }
+
+    let app_id = payload.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let token  = payload.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Best-effort text extraction from the first string option, or fall back
+    // to the command name itself.
+    let text = extract_discord_command_text(&payload);
+    let user = payload.pointer("/member/user/username")
+        .or_else(|| payload.pointer("/user/username"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("someone")
+        .to_string();
+
+    tracing::info!(%user, %app_id, "discord interaction received");
+
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        let system = Some(format!(
+            "You are Forge OS answering a Discord slash-command from @{user}."
+        ));
+        let reply = match call_forge_chat(&state_bg, &text, system.as_deref(), None).await {
+            Ok((r, _mid)) => r,
+            Err(e) => format!(":warning: Forge upstream error: {e}"),
+        };
+        let url = format!("https://discord.com/api/v10/webhooks/{app_id}/{token}/messages/@original");
+        let payload = serde_json::json!({"content": reply});
+        if let Err(e) = state_bg.http.patch(&url).json(&payload).send().await {
+            tracing::warn!(err = %e, "posting to discord followup failed");
+        }
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "type": DISCORD_RESPONSE_DEFERRED_MESSAGE,
+    }))).into_response()
+}
+
+fn extract_discord_command_text(payload: &serde_json::Value) -> String {
+    // Interaction data → options: [{ name, type, value }, ...]. Pull the
+    // first `type: 3` (STRING) option, else the command name itself.
+    if let Some(options) = payload.pointer("/data/options").and_then(|v| v.as_array()) {
+        for opt in options {
+            let ty = opt.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
+            if ty == 3 {
+                if let Some(s) = opt.get("value").and_then(|v| v.as_str()) {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    payload.pointer("/data/name").and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn verify_discord_signature(public_key_hex: &str, headers: &HeaderMap, body: &str) -> Result<()> {
+    let sig_hex = headers.get("X-Signature-Ed25519")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("missing X-Signature-Ed25519"))?;
+    let ts = headers.get("X-Signature-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("missing X-Signature-Timestamp"))?;
+
+    let pk_bytes = hex::decode(public_key_hex).context("public key must be hex")?;
+    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into()
+        .map_err(|_| anyhow::anyhow!("public key must be 32 bytes"))?;
+    let vk = VerifyingKey::from_bytes(&pk_arr).context("invalid ed25519 public key")?;
+
+    let sig_bytes = hex::decode(sig_hex).context("signature must be hex")?;
+    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into()
+        .map_err(|_| anyhow::anyhow!("signature must be 64 bytes"))?;
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let mut msg = Vec::with_capacity(ts.len() + body.len());
+    msg.extend_from_slice(ts.as_bytes());
+    msg.extend_from_slice(body.as_bytes());
+
+    vk.verify(&msg, &sig).context("signature mismatch")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// /telegram/webhook
+// ---------------------------------------------------------------------------
+//
+// Telegram POSTs the Bot API `Update` JSON. When we register the webhook
+// with setWebhook we can pass a secret token; Telegram then echoes it back
+// in the `X-Telegram-Bot-Api-Secret-Token` header.
+
+async fn telegram_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if state.telegram_bot_token.is_empty() {
+        return (StatusCode::NOT_FOUND, "telegram adapter disabled").into_response();
+    }
+    // Optional secret-token check.
+    if !state.telegram_secret_token.is_empty() {
+        let got = headers.get("X-Telegram-Bot-Api-Secret-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if got != state.telegram_secret_token.as_str() {
+            return (StatusCode::UNAUTHORIZED, "bad secret token").into_response();
+        }
+    }
+
+    let chat_id = body.pointer("/message/chat/id").and_then(|v| v.as_i64());
+    let text    = body.pointer("/message/text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let user    = body.pointer("/message/from/username").and_then(|v| v.as_str()).unwrap_or("someone").to_string();
+    if chat_id.is_none() || text.trim().is_empty() {
+        // Non-message updates (edited_message, channel_post, callback_query...)
+        // → ack and drop. We keep this handler dumb-simple.
+        return (StatusCode::OK, "ok").into_response();
+    }
+    let chat_id = chat_id.unwrap();
+
+    tracing::info!(%user, chat_id, "telegram message received");
+
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        let system = Some(format!(
+            "You are Forge OS answering a Telegram message from @{user}."
+        ));
+        let reply = match call_forge_chat(&state_bg, &text, system.as_deref(), None).await {
+            Ok((r, _mid)) => r,
+            Err(e) => format!("⚠️ Forge upstream error: {e}"),
+        };
+        let url = format!("https://api.telegram.org/bot{}/sendMessage",
+            state_bg.telegram_bot_token);
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text":    reply,
+        });
+        if let Err(e) = state_bg.http.post(&url).json(&payload).send().await {
+            tracing::warn!(err = %e, "posting to telegram sendMessage failed");
+        }
+    });
+
+    (StatusCode::OK, "ok").into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Upstream Forge call
 // ---------------------------------------------------------------------------
 
@@ -392,6 +613,9 @@ mod tests {
             forge_token:          Arc::new(String::new()),
             shared_secret:        Arc::new(shared.into()),
             slack_signing_secret: Arc::new(slack.into()),
+            discord_public_key:   Arc::new(String::new()),
+            telegram_bot_token:   Arc::new(String::new()),
+            telegram_secret_token:Arc::new(String::new()),
         }
     }
 
@@ -447,5 +671,59 @@ mod tests {
     #[test]
     fn build_router_smoke() {
         let _r = build_router(state_for_tests("", ""));
+    }
+
+    #[test]
+    fn discord_signature_verifies_when_correct() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand_core::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk_hex = hex::encode(sk.verifying_key().to_bytes());
+        let body = r#"{"type":1}"#;
+        let ts = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let sig = sk.sign(format!("{ts}{body}").as_bytes());
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        let mut h = HeaderMap::new();
+        h.insert("X-Signature-Ed25519",   sig_hex.parse().unwrap());
+        h.insert("X-Signature-Timestamp", ts.parse().unwrap());
+        assert!(verify_discord_signature(&pk_hex, &h, body).is_ok());
+    }
+
+    #[test]
+    fn discord_signature_rejects_tampered_body() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand_core::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk_hex = hex::encode(sk.verifying_key().to_bytes());
+        let body = r#"{"type":1}"#;
+        let ts = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let sig = sk.sign(format!("{ts}{body}").as_bytes());
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        let mut h = HeaderMap::new();
+        h.insert("X-Signature-Ed25519",   sig_hex.parse().unwrap());
+        h.insert("X-Signature-Timestamp", ts.parse().unwrap());
+        assert!(verify_discord_signature(&pk_hex, &h, r#"{"type":2}"#).is_err());
+    }
+
+    #[test]
+    fn discord_extracts_string_option() {
+        let payload = serde_json::json!({
+            "data": {
+                "name": "ask",
+                "options": [
+                    {"name":"limit",  "type": 4, "value": 5},
+                    {"name":"prompt", "type": 3, "value": "hello there"}
+                ]
+            }
+        });
+        assert_eq!(extract_discord_command_text(&payload), "hello there");
+    }
+
+    #[test]
+    fn discord_falls_back_to_command_name() {
+        let payload = serde_json::json!({"data":{"name":"status"}});
+        assert_eq!(extract_discord_command_text(&payload), "status");
     }
 }

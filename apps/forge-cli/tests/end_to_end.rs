@@ -65,6 +65,7 @@ async fn boot_server_on_ephemeral_port() -> (Runtime, std::net::SocketAddr, temp
         workers: 0,
         worker_stale_secs: 120,
         org_memory_enabled: false,
+        embedding_provider: None,
         api_bind: Some(addr),
         api_token_env: "FORGE_CLI_TEST_TOKEN".into(),
     };
