@@ -43,11 +43,24 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
       - name: Build (workspace, excluding desktop)
         run: cargo build --workspace --exclude forge-desktop --locked
+
+      # The forge-mcp stdio tests spawn `cargo run --example mock_mcp_server`
+      # as the child MCP server. Pre-build it here so the on-demand compile does
+      # not run inside the 15s initialize-handshake window (which flakes on cold
+      # Windows runners).
+      - name: Pre-build MCP mock server example
+        run: cargo build -p forge-mcp --example mock_mcp_server --locked
 
       - name: Test (workspace, excluding desktop)
         run: cargo test --workspace --exclude forge-desktop --locked
